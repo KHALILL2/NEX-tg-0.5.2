@@ -1,0 +1,15 @@
+# Gate Access Monitoring System — Development Dependencies
+# Install:  pip install -r requirements-dev.txt
+
+# Production deps (always needed)
+-r requirements.txt
+
+# Testing
+pytest>=7.4.0,<9.0
+pytest-cov>=4.1.0,<6.0
+
+# Type checking
+mypy>=1.5.0,<2.0
+
+# Linting
+pylint>=3.0.0,<4.0

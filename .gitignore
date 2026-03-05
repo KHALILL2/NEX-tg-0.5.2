@@ -1,0 +1,39 @@
+# ─── Python ───────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+dist/
+build/
+*.egg
+
+# ─── Virtual environment ──────────────────────────────────
+venv/
+.venv/
+env/
+bin/
+lib/
+lib64
+include/
+pyvenv.cfg
+pip-selfcheck.json
+
+# ─── IDE / Editor ─────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ─── OS artefacts ─────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ─── Logs ─────────────────────────────────────────────────
+*.log
+
+# ─── Environment / secrets ────────────────────────────────
+.env
+config.env
+!config.env.example

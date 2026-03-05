@@ -1,0 +1,46 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# gate-scanner.service — systemd unit for the Gate Access Monitoring System
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# Installation:
+#   sudo cp gate-scanner.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now gate-scanner.service
+#
+# Logs:
+#   journalctl -u gate-scanner -f
+#   tail -f ~/gate-scanner.log
+#
+# ═══════════════════════════════════════════════════════════════════════════════
+
+[Unit]
+Description=Gate Access Monitoring System (BATU University)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/gate-scanner
+
+# Load environment variables from config.env
+EnvironmentFile=/home/pi/gate-scanner/config.env
+
+# The display the GUI should appear on
+Environment=DISPLAY=:0
+
+ExecStart=/home/pi/gate-scanner/venv/bin/python gate.py
+
+# Restart on crash — wait 5 seconds between retries
+Restart=on-failure
+RestartSec=5
+
+# Allow access to serial ports
+SupplementaryGroups=dialout
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=graphical.target

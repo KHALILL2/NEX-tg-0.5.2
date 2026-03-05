@@ -1,0 +1,9 @@
+# Gate Access Monitoring System — Python Dependencies
+# Install:  pip install -r requirements.txt
+
+customtkinter>=5.2.0,<6.0
+Pillow>=10.0.0,<12.0
+requests>=2.31.0,<3.0
+pyserial>=3.5,<4.0
+arabic-reshaper>=3.0.0,<4.0
+python-bidi>=0.4.2,<1.0
