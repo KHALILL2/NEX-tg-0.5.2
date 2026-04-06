@@ -104,12 +104,24 @@ def _stub_heavy_libs():
     sys.modules["PIL.Image"] = image_stub
     sys.modules["PIL.ImageTk"] = imagetk_stub
 
+    # ── requests stub ─────────────────────────────────────────────────────────
+    requests_stub = types.ModuleType("requests")
+    requests_stub.exceptions = types.ModuleType("requests.exceptions")
+    requests_stub.exceptions.SSLError = type("SSLError", (Exception,), {})
+    requests_stub.exceptions.ConnectionError = type("ConnectionError", (Exception,), {})
+    requests_stub.exceptions.Timeout = type("Timeout", (Exception,), {})
+    requests_stub.post = MagicMock()
+    requests_stub.get = MagicMock()
+    sys.modules["requests"] = requests_stub
+    sys.modules["requests.exceptions"] = requests_stub.exceptions
+
     yield
 
     # Teardown — not strictly necessary since tests run and exit.
     for mod in (
         "customtkinter", "serial", "arabic_reshaper",
         "bidi", "bidi.algorithm", "PIL", "PIL.Image", "PIL.ImageTk",
+        "requests", "requests.exceptions",
     ):
         sys.modules.pop(mod, None)
 

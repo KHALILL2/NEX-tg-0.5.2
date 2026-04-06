@@ -583,8 +583,15 @@ class GateController:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# BARCODE VALIDATION
+# BARCODE UTILITIES
 # ═══════════════════════════════════════════════════════════════════════════════
+
+
+def _mask_barcode(code: str) -> str:
+    """Return a 12-character truncated SHA-256 hash of the barcode."""
+    if not code:
+        return ""
+    return hashlib.sha256(code.encode()).hexdigest()[:12]
 
 
 def validate_barcode(code: str) -> bool:
@@ -612,12 +619,12 @@ def validate_barcode(code: str) -> bool:
     if len(code) > BARCODE_MAX_LENGTH:
         log.warning(
             "SECURITY: barcode exceeds max length (%d > %d): %s…",
-            len(code), BARCODE_MAX_LENGTH, code[:20],
+            len(code), BARCODE_MAX_LENGTH, _mask_barcode(code),
         )
         return False
 
     if not _BARCODE_PATTERN.match(code):
-        log.warning("SECURITY: barcode contains invalid characters: %r", code[:50])
+        log.warning("SECURITY: barcode contains invalid characters: %s", _mask_barcode(code))
         return False
 
     return True
@@ -1530,7 +1537,7 @@ class GateApp(ctk.CTk):
         for attempt in range(1, max_retries + 1):
             try:
                 log.info("Scanning barcode: %s (attempt %d/%d)",
-                         code, attempt, max_retries)
+                         _mask_barcode(code), attempt, max_retries)
 
                 r = requests.post(
                     self._config.api_url,
@@ -1543,7 +1550,7 @@ class GateApp(ctk.CTk):
                 # ── Non-retryable HTTP errors ─────────────────────────────────
                 if r.status_code in (400, 401, 403, 404):
                     log.warning("API HTTP %d (non-retryable) for barcode %s",
-                                r.status_code, code)
+                                r.status_code, _mask_barcode(code))
                     break
 
                 # ── Successful response ───────────────────────────────────────
@@ -1556,12 +1563,12 @@ class GateApp(ctk.CTk):
                         allowed, student = validate_api_response(data)
                     except (ValidationError, ValueError) as exc:
                         log.error("Malformed API response for barcode %s: %s",
-                                  code, exc)
+                                  _mask_barcode(code), exc)
                         break
 
                     if allowed and student:
                         log.info("ACCESS GRANTED — %s (barcode %s)",
-                                 student.get("name", "?"), code)
+                                 student.get("name", "?"), _mask_barcode(code))
                         _health_state["total_granted"] += 1
                         self._offline_cache.store(code, student)
                         self.after(
@@ -1571,27 +1578,27 @@ class GateApp(ctk.CTk):
                         return
 
                     # Explicit denial from API — do not retry
-                    log.info("ACCESS DENIED by API — barcode %s", code)
+                    log.info("ACCESS DENIED by API — barcode %s", _mask_barcode(code))
                     break
 
                 # ── 5xx — retryable ───────────────────────────────────────────
                 log.warning("API HTTP %d for barcode %s (attempt %d/%d)",
-                            r.status_code, code, attempt, max_retries)
+                            r.status_code, _mask_barcode(code), attempt, max_retries)
 
             except requests.exceptions.SSLError as exc:
-                log.error("SSL error for barcode %s: %s", code, exc)
+                log.error("SSL error for barcode %s: %s", _mask_barcode(code), exc)
                 break  # SSL errors are never retried
 
             except requests.exceptions.ConnectionError as exc:
                 log.warning("Network unreachable for barcode %s (attempt %d/%d): %s",
-                            code, attempt, max_retries, exc)
+                            _mask_barcode(code), attempt, max_retries, exc)
 
             except requests.exceptions.Timeout:
                 log.warning("API timeout for barcode %s (attempt %d/%d)",
-                            code, attempt, max_retries)
+                            _mask_barcode(code), attempt, max_retries)
 
             except Exception as exc:
-                log.error("Unexpected API error for barcode %s: %s", code, exc)
+                log.error("Unexpected API error for barcode %s: %s", _mask_barcode(code), exc)
                 break
 
             # ── Wait before next retry (exponential backoff) ──────────────────
@@ -1646,7 +1653,7 @@ class GateApp(ctk.CTk):
             last = self._debounce.get(code, 0.0)
             if now - last < self._config.debounce_seconds:
                 log.debug("Debounce: ignored duplicate %s (%.1fs ago)",
-                          code, now - last)
+                          _mask_barcode(code), now - last)
                 return
             self._debounce[code] = now
 
