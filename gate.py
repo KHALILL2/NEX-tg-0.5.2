@@ -391,8 +391,8 @@ class GateController:
             if self._serial and self._serial.is_open:
                 try:
                     self._serial.close()
-                except Exception:
-                    pass
+                except Exception as exc:
+                    log.debug("Error closing serial port: %s", exc)
             self._is_connected = False
 
     # ── public command API ────────────────────────────────────────────────────
@@ -546,8 +546,8 @@ class GateController:
             if self._serial:
                 try:
                     self._serial.close()
-                except Exception:
-                    pass
+                except Exception as exc:
+                    log.debug("Error closing serial port: %s", exc)
                 self._serial = None
         self._set_gate_status(GateStatus.ERROR)
 
@@ -578,8 +578,8 @@ class GateController:
         if self._on_status_change:
             try:
                 self._on_status_change(status)
-            except Exception:
-                pass
+            except Exception as exc:
+                log.error("Status change callback failed: %s", exc)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

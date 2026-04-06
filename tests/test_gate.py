@@ -68,6 +68,17 @@ def _stub_heavy_libs():
     sys.modules["bidi"] = bidi_stub
     sys.modules["bidi.algorithm"] = bidi_algo
 
+    # ── requests stub ─────────────────────────────────────────────────────────
+    requests_stub = types.ModuleType("requests")
+    requests_stub.get = MagicMock()
+    requests_stub.post = MagicMock()
+    requests_stub.exceptions = types.ModuleType("requests.exceptions")
+    requests_stub.exceptions.SSLError = type("SSLError", (Exception,), {})
+    requests_stub.exceptions.ConnectionError = type("ConnectionError", (Exception,), {})
+    requests_stub.exceptions.Timeout = type("Timeout", (Exception,), {})
+    sys.modules["requests"] = requests_stub
+    sys.modules["requests.exceptions"] = requests_stub.exceptions
+
     # ── PIL stub ──────────────────────────────────────────────────────────────
     pil_stub = types.ModuleType("PIL")
     image_stub = types.ModuleType("PIL.Image")
@@ -110,6 +121,7 @@ def _stub_heavy_libs():
     for mod in (
         "customtkinter", "serial", "arabic_reshaper",
         "bidi", "bidi.algorithm", "PIL", "PIL.Image", "PIL.ImageTk",
+        "requests", "requests.exceptions",
     ):
         sys.modules.pop(mod, None)
 
@@ -408,3 +420,53 @@ class TestExceptions:
 
     def test_gate_error_is_exception(self, gate_module: types.ModuleType) -> None:
         assert issubclass(gate_module.GateError, Exception)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# GateController Exception Logging
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestGateControllerLogging:
+    """Verify that GateController logs exceptions instead of swallowing them."""
+
+    def test_shutdown_serial_close_error_is_logged(self, gate_module, caplog):
+        config = gate_module.GateConfig.from_env()
+        controller = gate_module.GateController(config)
+
+        # Mock serial object
+        mock_serial = MagicMock()
+        mock_serial.is_open = True
+        mock_serial.close.side_effect = Exception("Mock close error")
+        controller._serial = mock_serial
+
+        with caplog.at_level("DEBUG"):
+            controller.shutdown()
+
+        assert "Error closing serial port: Mock close error" in caplog.text
+
+    def test_mark_disconnected_serial_close_error_is_logged(self, gate_module, caplog):
+        config = gate_module.GateConfig.from_env()
+        controller = gate_module.GateController(config)
+
+        # Mock serial object
+        mock_serial = MagicMock()
+        mock_serial.close.side_effect = Exception("Mock close error")
+        controller._serial = mock_serial
+
+        with caplog.at_level("DEBUG"):
+            controller._mark_disconnected()
+
+        assert "Error closing serial port: Mock close error" in caplog.text
+
+    def test_status_change_callback_error_is_logged(self, gate_module, caplog):
+        config = gate_module.GateConfig.from_env()
+        controller = gate_module.GateController(config)
+
+        def failing_callback(status):
+            raise Exception("Callback failed!")
+
+        controller._on_status_change = failing_callback
+
+        with caplog.at_level("ERROR"):
+            controller._set_gate_status(gate_module.GateStatus.OPEN)
+
+        assert "Status change callback failed: Callback failed!" in caplog.text
