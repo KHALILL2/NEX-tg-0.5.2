@@ -901,7 +901,11 @@ def load_photo_async(
 
     Skips localhost URLs to avoid hanging during development.
     """
-    if not url or any(x in url.lower() for x in ("localhost", "127.0.0.1")):
+    if not url:
+        return
+
+    url_lower = url.lower()
+    if any(x in url_lower for x in ("localhost", "127.0.0.1")):
         return
 
     def _worker() -> None:
