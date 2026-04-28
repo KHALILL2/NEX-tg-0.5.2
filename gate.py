@@ -5,35 +5,34 @@ Gate Access Monitoring System — BATU University
 ================================================
 
 A fullscreen kiosk application for the Raspberry Pi 4B that controls a
-university turnstile gate.  It reads student barcodes, verifies them against
+university turnstile gate.  It reads student RFID cards, verifies them against
 a remote REST API, and displays student information on an attached monitor.
 
 Hardware
 --------
 - **Raspberry Pi 4B** — runs this script and the display.
-- **ATmega / Arduino** — controls solenoid lock, servo, LEDs, and buzzers
+- **Arduino Mega** — controls solenoid lock, servo, LEDs, and buzzers
   via USB-serial.  Accepts commands in ``TYPE:VALUE`` format
   (e.g. ``GATE:OPEN``, ``LED:GREEN``, ``BUZZER:RED``).
-- **USB Barcode Scanner** — HID keyboard mode (stdin) or dedicated serial.
+- **RFID Reader** — RC522 (via SPI), PN532, or Simulation.
 - **Monitor** — connected via HDMI; shows the CustomTkinter GUI.
 
 Environment Variables (see ``config.env.example`` for full list)
 -----------------------------------------------------------------
 ``GATE_API_URL``            API endpoint for access checks (**required**).
 ``GATE_API_KEY``            Bearer token sent as ``Authorization`` header.
-``GATE_API_CERT_PATH``      Path to CA bundle for SSL certificate pinning.
+``GATE_API_UID_FIELD``      JSON field for the card UID (default ``card_uid``).
 ``GATE_VERIFY_SSL``         Set ``false`` to disable SSL verification.
 ``GATE_API_TIMEOUT``        API request timeout in seconds (default ``8``).
-``GATE_API_MAX_RETRIES``    API retry attempts (default ``3``).
-``GATE_API_RETRY_DELAY``    Base delay between retries (default ``1``).
-``GATE_SERIAL_PORT``        Arduino serial port (default ``/dev/ttyACM0``).
-``GATE_BAUD_RATE``          Arduino baud rate  (default ``115200``).
-``BARCODE_SERIAL_PORT``     Serial port for barcode scanner (empty = stdin).
-``BARCODE_BAUD_RATE``       Barcode scanner baud rate (default ``9600``).
-``GATE_OPEN_DURATION``      Seconds the gate stays open (default ``5``).
-``DEBOUNCE_SECONDS``        Duplicate scan ignore window (default ``3``).
+``GATE_SERIAL_PORT``        Arduino Mega serial port (default ``/dev/ttyACM0``).
+``GATE_BAUD_RATE``          Arduino Mega baud rate  (default ``115200``).
+``RFID_READER_TYPE``        Reader type: ``RC522``, ``PN532``, or ``SIMULATION``.
+``CARD_DEBOUNCE_SECONDS``   Duplicate scan ignore window (default ``3``).
+``UID_HASH_KEY``            HMAC-SHA256 key for hashing UIDs (**required**).
+``SIMULATION_MODE``         Enable fake UID generation (default ``false``).
 ``BASE_MEDIA_URL``          Prefix for relative photo URLs.
 ``GATE_OFFLINE_MODE``       Enable offline cache fallback (default ``false``).
+
 ``GATE_OFFLINE_CACHE_TTL``  Offline cache TTL in seconds (default ``300``).
 ``GATE_HEALTH_PORT``        Health check HTTP port (default ``0`` = off).
 
@@ -47,8 +46,11 @@ License: MIT
 
 from __future__ import annotations
 
+import abc
+import collections
 import enum
 import hashlib
+import hmac
 import http.server
 import json
 import logging
@@ -58,7 +60,9 @@ import re
 import sys
 import threading
 import time
-from dataclasses import dataclass
+import queue
+import random
+from dataclasses import dataclass, field
 from datetime import datetime
 from io import BytesIO
 from typing import Any, Callable, Optional
@@ -66,9 +70,17 @@ from typing import Any, Callable, Optional
 import arabic_reshaper
 import customtkinter as ctk
 import requests
+from requests.adapters import HTTPAdapter
 import serial
 from bidi.algorithm import get_display
 from PIL import Image, ImageTk
+
+# RFID hardware — optional (graceful fallback for dev / simulation)
+try:
+    from mfrc522 import MFRC522
+    _RFID_HW_AVAILABLE = True
+except ImportError:
+    _RFID_HW_AVAILABLE = False
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # CUSTOM EXCEPTIONS
@@ -88,7 +100,11 @@ class APIError(GateError):
 
 
 class ValidationError(GateError):
-    """Raised when input validation fails (barcode, API response, etc.)."""
+    """Raised when input validation fails (UID, API response, etc.)."""
+
+
+class RFIDError(GateError):
+    """Raised when the RFID reader encounters a hardware or protocol error."""
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -131,9 +147,10 @@ ARDUINO_RECONNECT_MAX: float = 60.0     # max reconnect delay (cap)
 GATE_OPEN_CONFIRM_TIMEOUT: float = 3.0  # seconds to wait for OPEN ack
 PHOTO_FETCH_TIMEOUT: float = 8.0        # seconds for photo downloads
 
-# Barcode validation
-BARCODE_MAX_LENGTH: int = 50
-_BARCODE_PATTERN: re.Pattern[str] = re.compile(r"^[A-Za-z0-9\-_.]+$")
+# RFID / card-detection timing defaults
+RFID_POLL_INTERVAL: float = 0.05        # seconds between card polls
+UID_ALL_ZEROS: bytes = b"\x00\x00\x00\x00"  # reject test cards
+ROLLING_LATENCY_WINDOW: int = 100        # samples for rolling avg latency
 
 # Photo widget dimensions (pixels)
 MAIN_PHOTO_SIZE: tuple[int, int] = (400, 300)
@@ -170,18 +187,28 @@ class GateConfig:
     api_timeout: float
     api_max_retries: int
     api_retry_delay: float
+    api_uid_field: str
 
-    # ── Arduino / gate controller ─────────────────────────────────────────────
+    # ── Arduino Mega / gate controller ────────────────────────────────────────
     serial_port: str
     baud_rate: int
 
-    # ── Barcode scanner ───────────────────────────────────────────────────────
-    barcode_serial_port: str
-    barcode_baud_rate: int
+    # ── RFID reader ───────────────────────────────────────────────────────────
+    rfid_reader_type: str
+    rc522_rst_pin: int
+    rc522_spi_bus: int
+    rc522_spi_device: int
+
+    # ── MIFARE ────────────────────────────────────────────────────────────────
+    mifare_default_key: str
+    uid_hash_key: str
 
     # ── Gate timing ───────────────────────────────────────────────────────────
     gate_open_duration: float
-    debounce_seconds: float
+    card_debounce_seconds: float
+
+    # ── Performance ───────────────────────────────────────────────────────────
+    api_pool_size: int
 
     # ── Media ─────────────────────────────────────────────────────────────────
     base_media_url: str
@@ -192,6 +219,11 @@ class GateConfig:
 
     # ── Health check ──────────────────────────────────────────────────────────
     health_port: int
+
+    # ── Simulation ────────────────────────────────────────────────────────────
+    simulation_mode: bool
+    simulation_interval: float
+    simulation_success_rate: float
 
     # ── derived helpers ───────────────────────────────────────────────────────
 
@@ -230,28 +262,41 @@ class GateConfig:
         if gate_open_duration <= 0:
             raise GateError("GATE_OPEN_DURATION must be a positive number.")
 
-        debounce_seconds = float(os.getenv("DEBOUNCE_SECONDS", "3"))
-        if debounce_seconds < 0:
-            raise GateError("DEBOUNCE_SECONDS must be non-negative.")
+        card_debounce = float(os.getenv("CARD_DEBOUNCE_SECONDS", "0.5"))
+        if card_debounce < 0:
+            raise GateError("CARD_DEBOUNCE_SECONDS must be non-negative.")
+
+        sim_rate = float(os.getenv("SIMULATION_SUCCESS_RATE", "0.8"))
+        if not 0.0 <= sim_rate <= 1.0:
+            raise GateError("SIMULATION_SUCCESS_RATE must be between 0.0 and 1.0.")
 
         return cls(
             api_url=api_url,
             api_key=os.getenv("GATE_API_KEY", "").strip(),
             api_cert_path=api_cert_path,
             verify_ssl=_bool_env("GATE_VERIFY_SSL", True),
-            api_timeout=float(os.getenv("GATE_API_TIMEOUT", "8")),
+            api_timeout=float(os.getenv("GATE_API_TIMEOUT", "3.0")),
             api_max_retries=int(os.getenv("GATE_API_MAX_RETRIES", "3")),
             api_retry_delay=float(os.getenv("GATE_API_RETRY_DELAY", "1")),
+            api_uid_field=os.getenv("API_UID_FIELD", "card_uid").strip(),
             serial_port=os.getenv("GATE_SERIAL_PORT", "/dev/ttyACM0"),
             baud_rate=int(os.getenv("GATE_BAUD_RATE", "115200")),
-            barcode_serial_port=os.getenv("BARCODE_SERIAL_PORT", "").strip(),
-            barcode_baud_rate=int(os.getenv("BARCODE_BAUD_RATE", "9600")),
+            rfid_reader_type=os.getenv("RFID_READER_TYPE", "RC522").strip().upper(),
+            rc522_rst_pin=int(os.getenv("RC522_RST_PIN", "25")),
+            rc522_spi_bus=int(os.getenv("RC522_SPI_BUS", "0")),
+            rc522_spi_device=int(os.getenv("RC522_SPI_DEVICE", "0")),
+            mifare_default_key=os.getenv("MIFARE_DEFAULT_KEY", "FFFFFFFFFFFF"),
+            uid_hash_key=os.getenv("UID_HASH_KEY", "change-me-generate-with-openssl"),
             gate_open_duration=gate_open_duration,
-            debounce_seconds=debounce_seconds,
+            card_debounce_seconds=card_debounce,
+            api_pool_size=int(os.getenv("API_POOL_SIZE", "20")),
             base_media_url=os.getenv("BASE_MEDIA_URL", "").strip(),
             offline_mode=_bool_env("GATE_OFFLINE_MODE", False),
             offline_cache_ttl=float(os.getenv("GATE_OFFLINE_CACHE_TTL", "300")),
             health_port=int(os.getenv("GATE_HEALTH_PORT", "0")),
+            simulation_mode=_bool_env("SIMULATION_MODE", False),
+            simulation_interval=float(os.getenv("SIMULATION_INTERVAL_SECONDS", "3")),
+            simulation_success_rate=sim_rate,
         )
 
 
@@ -320,30 +365,423 @@ class GateStatus(enum.Enum):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# GATE CONTROLLER — encapsulates Arduino serial communication
+# CARD TYPE ENUM
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class CardType(enum.Enum):
+    """MIFARE card types detected by the RFID reader."""
+
+    UNKNOWN = "unknown"
+    MIFARE_1K = "mifare_1k"
+    MIFARE_4K = "mifare_4k"
+    MIFARE_ULTRALIGHT = "mifare_ultralight"
+    NTAG = "ntag"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# RFID CARD DATACLASS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+@dataclass(frozen=True)
+class RFIDCard:
+    """Immutable representation of a scanned RFID/NFC card.
+
+    Attributes
+    ----------
+    uid : str
+        Normalised UID string, e.g. ``"A3:B7:C2:D4"``.
+    uid_bytes : bytes
+        Raw UID bytes from the reader.
+    card_type : CardType
+        Detected MIFARE card type (from SAK byte).
+    atqa : bytes
+        Answer To Request Type A.
+    sak : bytes
+        Select Acknowledge byte(s).
+    read_timestamp : float
+        ``time.monotonic()`` when the card was read.
+    """
+
+    uid: str
+    uid_bytes: bytes
+    card_type: CardType
+    atqa: bytes
+    sak: bytes
+    read_timestamp: float
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# UID VALIDATOR — normalisation, validation, hashing
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class UIDValidator:
+    """Validates, normalises, and hashes MIFARE card UIDs.
+
+    All methods are pure static helpers — no instance state.
+    """
+
+    VALID_UID_LENGTHS: tuple[int, ...] = (4, 7, 10)
+
+    @staticmethod
+    def validate(uid_bytes: bytes) -> bool:
+        """Check that *uid_bytes* is a valid MIFARE UID.
+
+        Rules
+        -----
+        - Length must be 4, 7, or 10 bytes.
+        - All-zero UIDs (test/blank cards) are rejected.
+        """
+        if len(uid_bytes) not in UIDValidator.VALID_UID_LENGTHS:
+            log.warning(
+                "SECURITY: UID length %d invalid (expected %s)",
+                len(uid_bytes), UIDValidator.VALID_UID_LENGTHS,
+            )
+            return False
+        if uid_bytes == b"\x00" * len(uid_bytes):
+            log.warning("SECURITY: all-zero UID rejected (test/blank card)")
+            return False
+        return True
+
+    @staticmethod
+    def normalize(uid_bytes: bytes) -> str:
+        """Convert raw UID bytes to uppercase colon-separated hex.
+
+        Example: ``b'\\xa3\\xb7\\xc2\\xd4'`` → ``'A3:B7:C2:D4'``
+        """
+        return ":".join(f"{b:02X}" for b in uid_bytes)
+
+    @staticmethod
+    def to_api_format(uid: str) -> str:
+        """Remove separators for API transmission.
+
+        Example: ``'A3:B7:C2:D4'`` → ``'A3B7C2D4'``
+        """
+        return uid.replace(":", "").upper()
+
+    @staticmethod
+    def hash_uid(uid: str, secret_key: str) -> str:
+        """HMAC-SHA256 hash of the UID for secure logging.
+
+        The raw UID is **never** written to logs — only this hash.
+        """
+        return hmac.new(
+            secret_key.encode(), uid.encode(), hashlib.sha256,
+        ).hexdigest()[:16]
+
+    @staticmethod
+    def detect_card_type(sak: bytes) -> CardType:
+        """Detect MIFARE card type from the SAK (Select Acknowledge) byte."""
+        if not sak:
+            return CardType.UNKNOWN
+        sak_val = sak[0] if isinstance(sak, (bytes, bytearray)) else sak
+        if sak_val == 0x08:
+            return CardType.MIFARE_1K
+        if sak_val == 0x18:
+            return CardType.MIFARE_4K
+        if sak_val == 0x00:
+            return CardType.MIFARE_ULTRALIGHT
+        return CardType.UNKNOWN
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# RFID READER — abstract base + concrete implementations
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class RFIDReaderBase(abc.ABC):
+    """Abstract base class for RFID/NFC readers.
+
+    Subclass this to swap between RC522, PN532, or simulation readers
+    without changing the rest of the application.
+    """
+
+    @abc.abstractmethod
+    def initialize(self) -> bool:
+        """Initialise hardware.  Returns ``True`` on success."""
+
+    @abc.abstractmethod
+    def read_card(self) -> Optional[RFIDCard]:
+        """Non-blocking card read.  Returns ``None`` if no card present."""
+
+    @abc.abstractmethod
+    def reset(self) -> None:
+        """Reset the reader (e.g. after an error)."""
+
+    @abc.abstractmethod
+    def cleanup(self) -> None:
+        """Release hardware resources."""
+
+    @property
+    @abc.abstractmethod
+    def is_available(self) -> bool:
+        """Whether the reader hardware is connected and ready."""
+
+
+class RC522Reader(RFIDReaderBase):
+    """MFRC522-based RFID reader via SPI on Raspberry Pi.
+
+    SPI wiring (default)::
+
+        SDA  → GPIO 8  (CE0)
+        SCK  → GPIO 11 (SCLK)
+        MOSI → GPIO 10
+        MISO → GPIO 9
+        RST  → GPIO 25  (configurable via ``rst_pin``)
+
+    Falls back to unavailable state on non-RPi systems.
+    """
+
+    def __init__(self, rst_pin: int = 25, spi_bus: int = 0,
+                 spi_device: int = 0) -> None:
+        self._rst_pin = rst_pin
+        self._spi_bus = spi_bus
+        self._spi_device = spi_device
+        self._reader: Any = None
+        self._available = False
+
+    def initialize(self) -> bool:
+        if not _RFID_HW_AVAILABLE:
+            log.warning("mfrc522 library not available — RC522 reader disabled")
+            return False
+        try:
+            self._reader = MFRC522()
+            self._available = True
+            log.info(
+                "RC522 RFID reader initialised (RST=GPIO%d, SPI %d:%d)",
+                self._rst_pin, self._spi_bus, self._spi_device,
+            )
+            return True
+        except Exception as exc:
+            log.error("RC522 initialisation failed: %s", exc)
+            self._available = False
+            return False
+
+    def read_card(self) -> Optional[RFIDCard]:
+        if not self._available or self._reader is None:
+            return None
+        try:
+            status, tag_type = self._reader.MFRC522_Request(
+                self._reader.PICC_REQIDL,
+            )
+            if status != self._reader.MI_OK:
+                return None
+
+            status, raw_uid = self._reader.MFRC522_Anticoll()
+            if status != self._reader.MI_OK:
+                return None
+
+            uid_bytes = bytes(raw_uid[:4])
+            atqa = bytes([tag_type]) if isinstance(tag_type, int) else b"\x00"
+            sak = bytes([raw_uid[4]]) if len(raw_uid) > 4 else b"\x00"
+
+            return RFIDCard(
+                uid=UIDValidator.normalize(uid_bytes),
+                uid_bytes=uid_bytes,
+                card_type=UIDValidator.detect_card_type(sak),
+                atqa=atqa,
+                sak=sak,
+                read_timestamp=time.monotonic(),
+            )
+        except Exception as exc:
+            log.debug("RC522 read error: %s", exc)
+            return None
+
+    def reset(self) -> None:
+        if self._reader is not None:
+            try:
+                self._reader.MFRC522_Init()
+                log.debug("RC522 reset complete")
+            except Exception as exc:
+                log.warning("RC522 reset failed: %s", exc)
+
+    def cleanup(self) -> None:
+        self._available = False
+        log.info("RC522 reader cleaned up")
+
+    @property
+    def is_available(self) -> bool:
+        return self._available
+
+
+class PN532Reader(RFIDReaderBase):
+    """Stub for future PN532 NFC reader support.
+
+    All methods raise ``NotImplementedError`` with guidance on
+    what needs to be implemented.
+    """
+
+    def initialize(self) -> bool:
+        raise NotImplementedError(
+            "PN532 support is planned but not yet implemented. "
+            "Use RFID_READER_TYPE=RC522 or SIMULATION_MODE=true."
+        )
+
+    def read_card(self) -> Optional[RFIDCard]:
+        raise NotImplementedError("PN532 read_card not implemented")
+
+    def reset(self) -> None:
+        raise NotImplementedError("PN532 reset not implemented")
+
+    def cleanup(self) -> None:
+        pass
+
+    @property
+    def is_available(self) -> bool:
+        return False
+
+
+class SimulationReader(RFIDReaderBase):
+    """Simulated RFID reader for development without hardware.
+
+    Generates fake UIDs at configurable intervals with a realistic
+    scenario mix (configurable success rate).  All simulated reads
+    are logged clearly with ``[SIMULATION]`` prefix.
+    """
+
+    def __init__(self, interval: float = 3.0,
+                 success_rate: float = 0.8) -> None:
+        self._interval = interval
+        self._success_rate = success_rate
+        self._available = False
+        self._last_gen: float = 0.0
+        # Pool of fake UIDs so denied cards get re-scanned sometimes
+        self._uid_pool: list[bytes] = [
+            bytes([random.randint(1, 255) for _ in range(4)])
+            for _ in range(20)
+        ]
+
+    def initialize(self) -> bool:
+        self._available = True
+        log.info(
+            "[SIMULATION] RFID reader active — interval=%.1fs, "
+            "success_rate=%.0f%%",
+            self._interval, self._success_rate * 100,
+        )
+        return True
+
+    def read_card(self) -> Optional[RFIDCard]:
+        if not self._available:
+            return None
+        now = time.monotonic()
+        if now - self._last_gen < self._interval:
+            return None
+        self._last_gen = now
+
+        uid_bytes = random.choice(self._uid_pool)
+        sak = b"\x08"  # simulate MIFARE 1K
+        card = RFIDCard(
+            uid=UIDValidator.normalize(uid_bytes),
+            uid_bytes=uid_bytes,
+            card_type=CardType.MIFARE_1K,
+            atqa=b"\x04\x00",
+            sak=sak,
+            read_timestamp=now,
+        )
+        log.debug("[SIMULATION] Generated card UID %s", card.uid)
+        return card
+
+    def reset(self) -> None:
+        log.debug("[SIMULATION] Reader reset")
+
+    def cleanup(self) -> None:
+        self._available = False
+        log.info("[SIMULATION] Reader cleaned up")
+
+    @property
+    def is_available(self) -> bool:
+        return self._available
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CARD DETECTION MANAGER — anti-collision and debounce
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class CardDetectionManager:
+    """Tracks card-in-field state to avoid processing the same card twice.
+
+    Only returns ``True`` for **new** card presentations.  A card must
+    leave the field before it can be processed again.  Includes a
+    configurable debounce time for rapid tap protection.
+    """
+
+    def __init__(self, debounce_seconds: float = 0.5) -> None:
+        self._current_uid: Optional[str] = None
+        self._card_in_field: bool = False
+        self._last_process_time: float = 0.0
+        self._debounce: float = debounce_seconds
+        self._lock = threading.Lock()
+
+    def should_process(self, card: RFIDCard) -> bool:
+        """Return ``True`` only if *card* is a new presentation."""
+        with self._lock:
+            now = time.monotonic()
+
+            # Same card still in field — ignore
+            if self._card_in_field and card.uid == self._current_uid:
+                return False
+
+            # Different card or card returned — check debounce
+            if now - self._last_process_time < self._debounce:
+                return False
+
+            self._current_uid = card.uid
+            self._card_in_field = True
+            self._last_process_time = now
+            return True
+
+    def card_removed(self) -> None:
+        """Signal that no card is currently in the field."""
+        with self._lock:
+            self._card_in_field = False
+
+    def force_reset(self) -> None:
+        """Force-reset state (call after errors to avoid stuck state)."""
+        with self._lock:
+            self._current_uid = None
+            self._card_in_field = False
+            self._last_process_time = 0.0
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# GATE CONTROLLER — encapsulates Arduino Mega serial communication
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
 class GateController:
     """
-    Manages the Arduino / ESP32 gate controller over USB serial.
+    Manages the Arduino Mega gate controller over USB serial.
+
+    Arduino Mega Pin Layout::
+
+        Pin 22  →  Solenoid Relay (Active HIGH)
+        Pin 24  →  Servo Relay (Active LOW)
+        Pin 26  →  IR Sensor (gate occupancy)
+        Pin 28  →  Green LED + Buzzer
+        Pin 30  →  Red LED + Buzzer
+        I2C     →  PCA9685 Servo Driver
 
     Features
     --------
     - Thread-safe command sending.
     - **Automatic reconnection** with exponential backoff when disconnected.
     - Background reader thread that parses Arduino status messages
-      (``GATE_STATUS:OCCUPIED``, ``GATE_STATUS:CLEAR``, acknowledgements).
+      (``STATUS:*``, ``IR:*``, ``EMERGENCY:*``, acknowledgements).
     - Gate state tracking via :class:`GateStatus`.
+    - Proactive status polling via ``GATE:STATUS`` command.
     - Graceful shutdown (sends ``GATE:CLOSE`` + ``LED:OFF``).
 
     The controller speaks the ``TYPE:VALUE\\n`` protocol::
 
-        GATE:OPEN   — unlock solenoid + open servo
-        GATE:CLOSE  — close servo + lock solenoid
-        LED:GREEN   — green LED on (red off)
-        LED:RED     — red LED on (green off)
-        LED:OFF     — all LEDs off
+        GATE:OPEN    — unlock solenoid + open servo
+        GATE:CLOSE   — close servo + lock solenoid
+        GATE:STATUS  — request current gate status
+        LED:GREEN    — green LED on (red off)
+        LED:RED      — red LED on (green off)
+        LED:OFF      — all LEDs off
         BUZZER:GREEN / BUZZER:RED — short beep
     """
 
@@ -552,17 +990,51 @@ class GateController:
         self._set_gate_status(GateStatus.ERROR)
 
     def _handle_arduino_message(self, msg: str) -> None:
-        """Parse and act on a status message received from the Arduino."""
+        """Parse and act on a status message received from the Arduino Mega."""
         log.debug("← Arduino: %s", msg)
 
         upper = msg.upper()
-        if upper.startswith("GATE_STATUS:"):
+
+        # STATUS:* — gate/sensor status reports
+        if upper.startswith("STATUS:"):
             value = upper.split(":", 1)[1].strip()
             if value == "OCCUPIED":
                 self._set_gate_status(GateStatus.OCCUPIED)
             elif value == "CLEAR":
                 if self.gate_status == GateStatus.OCCUPIED:
                     self._set_gate_status(GateStatus.CLOSED)
+            elif value == "OPEN":
+                self._set_gate_status(GateStatus.OPEN)
+            elif value == "CLOSED":
+                self._set_gate_status(GateStatus.CLOSED)
+            elif value == "ERROR":
+                self._set_gate_status(GateStatus.ERROR)
+                log.error("Arduino reports gate ERROR")
+
+        # IR:* — infrared sensor events
+        elif upper.startswith("IR:"):
+            value = upper.split(":", 1)[1].strip()
+            if value == "BLOCKED":
+                self._set_gate_status(GateStatus.OCCUPIED)
+            elif value == "CLEAR":
+                if self.gate_status == GateStatus.OCCUPIED:
+                    self._set_gate_status(GateStatus.CLOSED)
+
+        # EMERGENCY:* — hardware emergency events
+        elif upper.startswith("EMERGENCY:"):
+            log.critical("EMERGENCY from Arduino: %s", msg)
+            self._set_gate_status(GateStatus.ERROR)
+
+        # Legacy GATE_STATUS:* format (backward compatibility)
+        elif upper.startswith("GATE_STATUS:"):
+            value = upper.split(":", 1)[1].strip()
+            if value == "OCCUPIED":
+                self._set_gate_status(GateStatus.OCCUPIED)
+            elif value == "CLEAR":
+                if self.gate_status == GateStatus.OCCUPIED:
+                    self._set_gate_status(GateStatus.CLOSED)
+
+        # Acknowledgement keywords
         elif "opened" in msg.lower():
             self._set_gate_status(GateStatus.OPEN)
         elif "closed" in msg.lower():
@@ -583,44 +1055,52 @@ class GateController:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# BARCODE VALIDATION
+# STARTUP CONFIGURATION VALIDATION
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
-def validate_barcode(code: str) -> bool:
+def validate_startup_config(config: GateConfig) -> list[str]:
     """
-    Validate a scanned barcode string.
+    Validate configuration at startup and return a list of warnings.
 
-    Rules
-    -----
-    - Must not be empty.
-    - Maximum ``BARCODE_MAX_LENGTH`` characters (50).
-    - Only alphanumeric characters, hyphens, underscores, dots.
-    - No control characters or embedded whitespace.
-
-    Rejected scans are logged at WARNING for security monitoring.
-
-    Returns
-    -------
-    bool
-        ``True`` if the barcode passes validation.
+    Critical issues raise :class:`GateError`; non-critical ones are
+    returned as warning strings for the caller to log.
     """
-    if not code:
-        log.warning("SECURITY: empty barcode rejected")
-        return False
+    warnings: list[str] = []
 
-    if len(code) > BARCODE_MAX_LENGTH:
-        log.warning(
-            "SECURITY: barcode exceeds max length (%d > %d): %s…",
-            len(code), BARCODE_MAX_LENGTH, code[:20],
+    # RFID reader type
+    valid_readers = {"RC522", "PN532", "SIMULATION"}
+    if config.rfid_reader_type not in valid_readers:
+        raise GateError(
+            f"RFID_READER_TYPE must be one of {valid_readers}, "
+            f"got '{config.rfid_reader_type}'"
         )
-        return False
 
-    if not _BARCODE_PATTERN.match(code):
-        log.warning("SECURITY: barcode contains invalid characters: %r", code[:50])
-        return False
+    # SPI pins (GPIO range 0-27 for BCM)
+    if not 0 <= config.rc522_rst_pin <= 27:
+        warnings.append(
+            f"RC522_RST_PIN={config.rc522_rst_pin} outside typical GPIO range (0-27)"
+        )
 
-    return True
+    # HMAC key
+    if config.uid_hash_key in ("", "change-me-generate-with-openssl"):
+        warnings.append(
+            "UID_HASH_KEY is not set — generate one with: openssl rand -hex 32"
+        )
+
+    # API URL scheme
+    if config.api_url and not config.api_url.startswith("https://"):
+        warnings.append(
+            f"API URL is not HTTPS: {config.api_url} — consider using HTTPS"
+        )
+
+    # Simulation mode notice
+    if config.simulation_mode:
+        warnings.append(
+            "SIMULATION_MODE is enabled — no real RFID hardware will be used"
+        )
+
+    return warnings
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -688,7 +1168,7 @@ class OfflineCache:
 
     When enabled and the API is unreachable, the system can grant access
     to students who were recently verified.  All offline-granted entries
-    are logged with the barcode hash for auditing.
+    are logged with the UID hash for auditing.
 
     Thread-safe.
     """
@@ -704,23 +1184,23 @@ class OfflineCache:
         return self._enabled
 
     @staticmethod
-    def _key(barcode: str) -> str:
-        """SHA-256 hash of the barcode (never store raw barcodes on disk)."""
-        return hashlib.sha256(barcode.encode()).hexdigest()
+    def _key(identifier: str) -> str:
+        """SHA-256 hash of the identifier (never store raw UIDs on disk)."""
+        return hashlib.sha256(identifier.encode()).hexdigest()
 
-    def store(self, barcode: str, student: dict[str, Any]) -> None:
+    def store(self, uid: str, student: dict[str, Any]) -> None:
         """Cache a successful access check result."""
         if not self._enabled:
             return
-        key = self._key(barcode)
+        key = self._key(uid)
         with self._lock:
             self._cache[key] = (student, time.time())
 
-    def lookup(self, barcode: str) -> Optional[dict[str, Any]]:
+    def lookup(self, uid: str) -> Optional[dict[str, Any]]:
         """Return cached student data if still valid, or ``None``."""
         if not self._enabled:
             return None
-        key = self._key(barcode)
+        key = self._key(uid)
         with self._lock:
             entry = self._cache.get(key)
             if entry is None:
@@ -755,6 +1235,10 @@ _health_state: dict[str, Any] = {
     "total_scans": 0,
     "total_granted": 0,
     "total_denied": 0,
+    "failed_scans": 0,
+    "avg_latency_ms": 0.0,
+    "rfid_reader_type": "",
+    "rfid_available": False,
 }
 
 
@@ -1231,6 +1715,263 @@ class SmallStudentCard(ctk.CTkFrame):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# HIGH-THROUGHPUT PROCESSOR — optimised for 6 000 students / day
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class HighThroughputProcessor:
+    """Optimised scan-processing pipeline for 500-800 students/hour peaks.
+
+    Architecture::
+
+        [RFID Reader] → [CardDetectionManager] → [Queue] → [API Worker]
+                                                              ↓
+                                                        [GateController]
+                                                        [GUI callback]
+
+    - Detection loop polls the RFID reader and filters via CardDetectionManager.
+    - API worker thread processes the queue with a connection-pooled session.
+    - Rolling average latency tracking (last 100 scans).
+    """
+
+    def __init__(
+        self,
+        config: GateConfig,
+        controller: GateController,
+        reader: RFIDReaderBase,
+        offline_cache: OfflineCache,
+        ui_callback: Callable[[dict[str, Any], str], None],
+    ) -> None:
+        self._config = config
+        self._controller = controller
+        self._reader = reader
+        self._offline_cache = offline_cache
+        self._ui_callback = ui_callback  # GateApp._push_entry via after()
+
+        self._detection_mgr = CardDetectionManager(config.card_debounce_seconds)
+        self._queue: queue.Queue[RFIDCard] = queue.Queue(maxsize=10)
+        self._shutdown = threading.Event()
+
+        # Connection-pooled HTTP session
+        self._session = requests.Session()
+        adapter = HTTPAdapter(
+            pool_connections=10,
+            pool_maxsize=config.api_pool_size,
+        )
+        self._session.mount("https://", adapter)
+        self._session.mount("http://", adapter)
+        if config.api_key:
+            self._session.headers["Authorization"] = f"Bearer {config.api_key}"
+        self._session.headers["Accept"] = "application/json"
+        self._session.headers["Content-Type"] = "application/json"
+
+        # Metrics
+        self._latencies: collections.deque[float] = collections.deque(
+            maxlen=ROLLING_LATENCY_WINDOW,
+        )
+
+    @property
+    def metrics(self) -> dict[str, Any]:
+        """Current performance metrics snapshot."""
+        lats = list(self._latencies)
+        return {
+            "avg_latency_ms": round(sum(lats) / len(lats) * 1000, 1) if lats else 0.0,
+        }
+
+    # ── lifecycle ─────────────────────────────────────────────────────────────
+
+    def start(self) -> None:
+        """Launch detection + worker threads."""
+        threading.Thread(
+            target=self._detection_loop, daemon=True, name="rfid-detect",
+        ).start()
+        threading.Thread(
+            target=self._api_worker, daemon=True, name="api-worker",
+        ).start()
+        log.info("HighThroughputProcessor started")
+
+    def stop(self) -> None:
+        self._shutdown.set()
+        self._session.close()
+        self._reader.cleanup()
+
+    # ── detection loop ────────────────────────────────────────────────────────
+
+    def _detection_loop(self) -> None:
+        """Poll the RFID reader; enqueue new cards for processing."""
+        consecutive_errors = 0
+        while not self._shutdown.is_set():
+            try:
+                card = self._reader.read_card()
+                if card is None:
+                    self._detection_mgr.card_removed()
+                    time.sleep(RFID_POLL_INTERVAL)
+                    consecutive_errors = 0
+                    continue
+
+                if not UIDValidator.validate(card.uid_bytes):
+                    continue
+
+                if self._detection_mgr.should_process(card):
+                    uid_hash = UIDValidator.hash_uid(
+                        card.uid, self._config.uid_hash_key,
+                    )
+                    log.info(
+                        "Card detected [%s] type=%s hash=%s",
+                        card.card_type.value, card.card_type.name, uid_hash,
+                    )
+                    try:
+                        self._queue.put_nowait(card)
+                    except queue.Full:
+                        log.warning("Processing queue full — card dropped")
+
+                consecutive_errors = 0
+
+            except Exception as exc:
+                consecutive_errors += 1
+                log.error("RFID detection error: %s", exc)
+                if consecutive_errors >= 5:
+                    log.warning("Too many errors — resetting reader")
+                    self._reader.reset()
+                    self._detection_mgr.force_reset()
+                    consecutive_errors = 0
+                time.sleep(0.5)
+
+    # ── API worker ────────────────────────────────────────────────────────────
+
+    def _api_worker(self) -> None:
+        """Process queued cards: API call + gate control + UI update."""
+        while not self._shutdown.is_set():
+            try:
+                card = self._queue.get(timeout=1.0)
+            except queue.Empty:
+                continue
+            self._process_card(card)
+
+    def _process_card(self, card: RFIDCard) -> None:
+        """Full scan pipeline for a single card."""
+        start = time.monotonic()
+        _health_state["total_scans"] += 1
+        _health_state["last_scan_time"] = start
+
+        uid_api = UIDValidator.to_api_format(card.uid)
+        uid_hash = UIDValidator.hash_uid(card.uid, self._config.uid_hash_key)
+
+        ssl_verify = self._config.ssl_verify
+        max_retries = self._config.api_max_retries
+        base_delay = self._config.api_retry_delay
+        api_reachable = False
+
+        for attempt in range(1, max_retries + 1):
+            try:
+                log.info(
+                    "Verifying card hash=%s (attempt %d/%d)",
+                    uid_hash, attempt, max_retries,
+                )
+                r = self._session.post(
+                    self._config.api_url,
+                    json={self._config.api_uid_field: uid_api},
+                    timeout=self._config.api_timeout,
+                    verify=ssl_verify,
+                )
+
+                # Non-retryable
+                if r.status_code in (400, 401, 403, 404):
+                    log.warning(
+                        "API HTTP %d (non-retryable) hash=%s",
+                        r.status_code, uid_hash,
+                    )
+                    break
+
+                if r.status_code == 200:
+                    api_reachable = True
+                    _health_state["last_api_success_time"] = time.monotonic()
+
+                    try:
+                        data = r.json()
+                        allowed, student = validate_api_response(data)
+                    except (ValidationError, ValueError) as exc:
+                        log.error("Malformed API response hash=%s: %s", uid_hash, exc)
+                        break
+
+                    if allowed and student:
+                        log.info("ACCESS GRANTED — %s (hash=%s)",
+                                 student.get("name", "?"), uid_hash)
+                        _health_state["total_granted"] += 1
+                        self._offline_cache.store(card.uid, student)
+                        self._ui_callback(student, "granted")
+                        self._controller.grant_access_sequence()
+                        self._record_latency(start)
+                        return
+
+                    log.info("ACCESS DENIED by API — hash=%s", uid_hash)
+                    break
+
+                # 5xx retryable
+                log.warning(
+                    "API HTTP %d hash=%s (attempt %d/%d)",
+                    r.status_code, uid_hash, attempt, max_retries,
+                )
+
+            except requests.exceptions.SSLError as exc:
+                log.error("SSL error hash=%s: %s", uid_hash, exc)
+                break
+
+            except requests.exceptions.ConnectionError as exc:
+                log.warning(
+                    "Network unreachable hash=%s (attempt %d/%d): %s",
+                    uid_hash, attempt, max_retries, exc,
+                )
+
+            except requests.exceptions.Timeout:
+                log.warning(
+                    "API timeout hash=%s (attempt %d/%d)",
+                    uid_hash, attempt, max_retries,
+                )
+
+            except Exception as exc:
+                log.error("Unexpected API error hash=%s: %s", uid_hash, exc)
+                break
+
+            if attempt < max_retries:
+                delay = base_delay * (2 ** (attempt - 1))
+                log.debug("Retrying in %.1fs…", delay)
+                time.sleep(delay)
+
+        # All retries exhausted — try offline cache
+        if not api_reachable:
+            cached = self._offline_cache.lookup(card.uid)
+            if cached:
+                log.info("OFFLINE CACHE HIT (hash=%s) — granting access", uid_hash)
+                _health_state["total_granted"] += 1
+                self._ui_callback(cached, "granted")
+                self._controller.grant_access_sequence()
+                self._record_latency(start)
+                return
+
+        # Denied
+        _health_state["total_denied"] += 1
+        _health_state["failed_scans"] += 1
+        denied_data: dict[str, Any] = {
+            "name": "بطاقة غير صالحة",
+            "seat_number": "",
+            "college": "",
+            "department": "",
+        }
+        self._ui_callback(denied_data, "denied")
+        self._controller.deny_access_sequence()
+        self._record_latency(start)
+
+    def _record_latency(self, start: float) -> None:
+        elapsed = time.monotonic() - start
+        self._latencies.append(elapsed)
+        lats = list(self._latencies)
+        _health_state["avg_latency_ms"] = round(
+            sum(lats) / len(lats) * 1000, 1,
+        ) if lats else 0.0
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # MAIN APPLICATION
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -1258,7 +1999,6 @@ class GateApp(ctk.CTk):
     --------------
     - ``_history``  : list of plain dicts (newest-first).
     - ``_current``  : dict of the student on the main card.
-    - ``_debounce`` : ``{barcode: monotonic_time}`` for rapid-scan rejection.
     """
 
     MAX_HISTORY: int = 3
@@ -1267,6 +2007,7 @@ class GateApp(ctk.CTk):
         self,
         config: GateConfig,
         controller: GateController,
+        rfid_reader: RFIDReaderBase,
     ) -> None:
         super().__init__()
         self.title("نظام مراقبة البوابة - Gate Access System")
@@ -1282,8 +2023,6 @@ class GateApp(ctk.CTk):
         # ── state ─────────────────────────────────────────────────────────────
         self._history: list[dict[str, Any]] = []
         self._current: Optional[dict[str, Any]] = None
-        self._debounce: dict[str, float] = {}
-        self._debounce_lock: threading.Lock = threading.Lock()
 
         # ── UI ────────────────────────────────────────────────────────────────
         self._build_header()
@@ -1293,11 +2032,13 @@ class GateApp(ctk.CTk):
         # ── periodic updates ──────────────────────────────────────────────────
         self._update_arduino_indicator()
 
-        # ── start scanner in the background ───────────────────────────────────
-        threading.Thread(
-            target=self._scanner_loop, daemon=True, name="scanner",
-        ).start()
-        log.info("GUI started — waiting for scans")
+        # ── start RFID processor ──────────────────────────────────────────────
+        self._processor = HighThroughputProcessor(
+            config, controller, rfid_reader, self._offline_cache,
+            ui_callback=self._schedule_push_entry,
+        )
+        self._processor.start()
+        log.info("GUI started — waiting for RFID scans")
 
     # ═════════════════════════════════════════════════════════════════════════
     # UI CONSTRUCTION
@@ -1496,218 +2237,52 @@ class GateApp(ctk.CTk):
         )
 
     # ═════════════════════════════════════════════════════════════════════════
-    # SCAN PROCESSING — runs in a background thread
+    # THREAD-SAFE UI CALLBACK
     # ═════════════════════════════════════════════════════════════════════════
 
-    def _process_scan(self, code: str) -> None:
-        """
-        Call the access-check API with retry logic, then schedule the UI update.
+    def _schedule_push_entry(
+        self, student: dict[str, Any], status: str,
+    ) -> None:
+        """Schedule ``_push_entry`` on the Tk main thread (thread-safe)."""
+        self.after(0, lambda s=student, st=status: self._push_entry(s, st))
 
-        Runs in a **daemon thread** — all Tk updates are posted via
-        ``self.after(0, …)`` to remain thread-safe.
 
-        Retry policy:
-        - Up to ``api_max_retries`` attempts.
-        - Exponential backoff starting at ``api_retry_delay`` seconds.
-        - Only retryable errors (timeout, 5xx, ConnectionError) are retried.
-        - 4xx and SSL errors cause immediate failure.
-        """
-        _health_state["total_scans"] += 1
-        _health_state["last_scan_time"] = time.monotonic()
+# ═══════════════════════════════════════════════════════════════════════════════
+# RFID READER FACTORY
+# ═══════════════════════════════════════════════════════════════════════════════
 
-        headers: dict[str, str] = {
-            "Accept":       "application/json",
-            "Content-Type": "application/json",
-        }
-        if self._config.api_key:
-            headers["Authorization"] = f"Bearer {self._config.api_key}"
 
-        ssl_verify = self._config.ssl_verify
-        max_retries = self._config.api_max_retries
-        base_delay = self._config.api_retry_delay
-        api_reachable = False
+def _create_rfid_reader(config: GateConfig) -> RFIDReaderBase:
+    """Instantiate the correct RFID reader based on configuration."""
+    if config.simulation_mode or config.rfid_reader_type == "SIMULATION":
+        reader = SimulationReader(
+            interval=config.simulation_interval,
+            success_rate=config.simulation_success_rate,
+        )
+    elif config.rfid_reader_type == "RC522":
+        reader = RC522Reader(
+            rst_pin=config.rc522_rst_pin,
+            spi_bus=config.rc522_spi_bus,
+            spi_device=config.rc522_spi_device,
+        )
+    elif config.rfid_reader_type == "PN532":
+        reader = PN532Reader()
+    else:
+        raise GateError(f"Unknown RFID reader type: {config.rfid_reader_type}")
 
-        for attempt in range(1, max_retries + 1):
-            try:
-                log.info("Scanning barcode: %s (attempt %d/%d)",
-                         code, attempt, max_retries)
+    if not reader.initialize():
+        # RC522 on non-RPi — fall back to simulation
+        log.warning(
+            "RFID reader '%s' unavailable — falling back to simulation mode",
+            config.rfid_reader_type,
+        )
+        reader = SimulationReader(
+            interval=config.simulation_interval,
+            success_rate=config.simulation_success_rate,
+        )
+        reader.initialize()
 
-                r = requests.post(
-                    self._config.api_url,
-                    json={"bar_code": code},
-                    headers=headers,
-                    timeout=self._config.api_timeout,
-                    verify=ssl_verify,
-                )
-
-                # ── Non-retryable HTTP errors ─────────────────────────────────
-                if r.status_code in (400, 401, 403, 404):
-                    log.warning("API HTTP %d (non-retryable) for barcode %s",
-                                r.status_code, code)
-                    break
-
-                # ── Successful response ───────────────────────────────────────
-                if r.status_code == 200:
-                    api_reachable = True
-                    _health_state["last_api_success_time"] = time.monotonic()
-
-                    try:
-                        data = r.json()
-                        allowed, student = validate_api_response(data)
-                    except (ValidationError, ValueError) as exc:
-                        log.error("Malformed API response for barcode %s: %s",
-                                  code, exc)
-                        break
-
-                    if allowed and student:
-                        log.info("ACCESS GRANTED — %s (barcode %s)",
-                                 student.get("name", "?"), code)
-                        _health_state["total_granted"] += 1
-                        self._offline_cache.store(code, student)
-                        self.after(
-                            0, lambda s=student: self._push_entry(s, "granted"),
-                        )
-                        self._controller.grant_access_sequence()
-                        return
-
-                    # Explicit denial from API — do not retry
-                    log.info("ACCESS DENIED by API — barcode %s", code)
-                    break
-
-                # ── 5xx — retryable ───────────────────────────────────────────
-                log.warning("API HTTP %d for barcode %s (attempt %d/%d)",
-                            r.status_code, code, attempt, max_retries)
-
-            except requests.exceptions.SSLError as exc:
-                log.error("SSL error for barcode %s: %s", code, exc)
-                break  # SSL errors are never retried
-
-            except requests.exceptions.ConnectionError as exc:
-                log.warning("Network unreachable for barcode %s (attempt %d/%d): %s",
-                            code, attempt, max_retries, exc)
-
-            except requests.exceptions.Timeout:
-                log.warning("API timeout for barcode %s (attempt %d/%d)",
-                            code, attempt, max_retries)
-
-            except Exception as exc:
-                log.error("Unexpected API error for barcode %s: %s", code, exc)
-                break
-
-            # ── Wait before next retry (exponential backoff) ──────────────────
-            if attempt < max_retries:
-                delay = base_delay * (2 ** (attempt - 1))
-                log.debug("Retrying in %.1fs…", delay)
-                time.sleep(delay)
-
-        # ── All retries exhausted / non-retryable error ───────────────────────
-
-        # Try offline cache if the API was not reachable at all
-        if not api_reachable:
-            cached = self._offline_cache.lookup(code)
-            if cached:
-                barcode_hash = hashlib.sha256(code.encode()).hexdigest()[:12]
-                log.info("OFFLINE CACHE HIT (hash %s) — granting access",
-                         barcode_hash)
-                _health_state["total_granted"] += 1
-                self.after(
-                    0, lambda s=cached: self._push_entry(s, "granted"),
-                )
-                self._controller.grant_access_sequence()
-                return
-
-        # ── Denied — generic message (never expose raw barcode on screen) ─────
-        _health_state["total_denied"] += 1
-        denied_data: dict[str, Any] = {
-            "name": "بطاقة غير صالحة",
-            "seat_number": "",
-            "college": "",
-            "department": "",
-        }
-        self.after(0, lambda d=denied_data: self._push_entry(d, "denied"))
-        self._controller.deny_access_sequence()
-
-    # ═════════════════════════════════════════════════════════════════════════
-    # DEBOUNCE — thread-safe
-    # ═════════════════════════════════════════════════════════════════════════
-
-    def _handle_code(self, code: str) -> None:
-        """
-        Accept a scanned barcode, validate it, apply debounce, then
-        dispatch to ``_process_scan`` in a background thread.
-        """
-        # ── input validation ──────────────────────────────────────────────────
-        if not validate_barcode(code):
-            return
-
-        # ── debounce (thread-safe) ────────────────────────────────────────────
-        now = time.monotonic()
-        with self._debounce_lock:
-            last = self._debounce.get(code, 0.0)
-            if now - last < self._config.debounce_seconds:
-                log.debug("Debounce: ignored duplicate %s (%.1fs ago)",
-                          code, now - last)
-                return
-            self._debounce[code] = now
-
-            # Prune stale entries so the dict stays small
-            cutoff = now - self._config.debounce_seconds * 20
-            self._debounce = {
-                k: v for k, v in self._debounce.items() if v > cutoff
-            }
-
-        threading.Thread(
-            target=self._process_scan, args=(code,), daemon=True,
-        ).start()
-
-    # ═════════════════════════════════════════════════════════════════════════
-    # SCANNER INPUT LOOP
-    # ═════════════════════════════════════════════════════════════════════════
-
-    def _scanner_loop(self) -> None:
-        """Route barcode input to serial or stdin based on config."""
-        if self._config.barcode_serial_port:
-            self._serial_scanner()
-        else:
-            self._stdin_scanner()
-
-    def _stdin_scanner(self) -> None:
-        """
-        Read barcodes from **stdin** (USB HID keyboard mode).
-
-        Each scan produces a line of text terminated by Enter.
-        """
-        log.info("Barcode input: stdin (USB HID keyboard mode)")
-        while True:
-            try:
-                code = input().strip()
-                if code:
-                    self._handle_code(code)
-            except EOFError:
-                log.warning("stdin closed — barcode scanning stopped")
-                break
-            except Exception as exc:
-                log.error("stdin scanner error: %s", exc)
-                time.sleep(1)
-
-    def _serial_scanner(self) -> None:
-        """
-        Read barcodes from a **dedicated serial port** with auto-reconnect.
-        """
-        port = self._config.barcode_serial_port
-        baud = self._config.barcode_baud_rate
-        log.info("Barcode input: serial %s @ %d baud", port, baud)
-        while True:
-            try:
-                with serial.Serial(port, baud, timeout=1) as sc:
-                    log.info("Barcode scanner connected on %s", port)
-                    while True:
-                        line = sc.readline().decode(errors="ignore").strip()
-                        if line:
-                            self._handle_code(line)
-            except serial.SerialException as exc:
-                log.error("Barcode serial error: %s — retrying in 5 s", exc)
-                time.sleep(5)
+    return reader
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1728,14 +2303,31 @@ if __name__ == "__main__":
         log.critical("Configuration error: %s", e)
         sys.exit(1)
 
-    log.info("API URL      : %s", cfg.api_url)
-    log.info("API key      : %s", "configured" if cfg.api_key else "NOT SET")
-    log.info("SSL verify   : %s", cfg.ssl_verify)
-    log.info("Serial port  : %s @ %d baud", cfg.serial_port, cfg.baud_rate)
-    log.info("Gate open    : %.1fs", cfg.gate_open_duration)
-    log.info("Debounce     : %.1fs", cfg.debounce_seconds)
-    log.info("Offline mode : %s (TTL %ds)", cfg.offline_mode, int(cfg.offline_cache_ttl))
-    log.info("Health port  : %s", cfg.health_port or "disabled")
+    try:
+        startup_warnings = validate_startup_config(cfg)
+        for w in startup_warnings:
+            log.warning("CONFIG: %s", w)
+    except GateError as e:
+        log.critical("Configuration validation failed: %s", e)
+        sys.exit(1)
+
+    log.info("API URL         : %s", cfg.api_url)
+    log.info("API key         : %s", "configured" if cfg.api_key else "NOT SET")
+    log.info("API UID field   : %s", cfg.api_uid_field)
+    log.info("SSL verify      : %s", cfg.ssl_verify)
+    log.info("Serial port     : %s @ %d baud", cfg.serial_port, cfg.baud_rate)
+    log.info("RFID reader     : %s", cfg.rfid_reader_type)
+    log.info("Gate open       : %.1fs", cfg.gate_open_duration)
+    log.info("Card debounce   : %.1fs", cfg.card_debounce_seconds)
+    log.info("Pool size       : %d", cfg.api_pool_size)
+    log.info("Offline mode    : %s (TTL %ds)", cfg.offline_mode, int(cfg.offline_cache_ttl))
+    log.info("Simulation mode : %s", cfg.simulation_mode)
+    log.info("Health port     : %s", cfg.health_port or "disabled")
+
+    # ── Initialise RFID reader ────────────────────────────────────────────────
+    rfid_reader = _create_rfid_reader(cfg)
+    _health_state["rfid_reader_type"] = cfg.rfid_reader_type
+    _health_state["rfid_available"] = rfid_reader.is_available
 
     # ── Initialise gate controller ────────────────────────────────────────────
     gate_ctrl = GateController(cfg)
@@ -1748,11 +2340,13 @@ if __name__ == "__main__":
         health_srv.start()
 
     # ── Launch the GUI ────────────────────────────────────────────────────────
-    app = GateApp(cfg, gate_ctrl)
+    app = GateApp(cfg, gate_ctrl, rfid_reader)
     try:
         app.mainloop()
     finally:
         log.info("Shutting down…")
+        if hasattr(app, "_processor"):
+            app._processor.stop()
         gate_ctrl.shutdown()
         if health_srv:
             health_srv.stop()

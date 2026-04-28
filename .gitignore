@@ -37,3 +37,11 @@ desktop.ini
 .env
 config.env
 !config.env.example
+
+# ─── Temporary / one-off scripts ──────────────────────────
+truncate_gate.py
+
+# ─── Test artefacts ───────────────────────────────────────
+.pytest_cache/
+htmlcov/
+.coverage

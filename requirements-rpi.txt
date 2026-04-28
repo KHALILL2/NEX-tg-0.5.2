@@ -1,0 +1,6 @@
+# RPi-specific dependencies for RFID hardware
+# Install on Raspberry Pi only:  pip install -r requirements-rpi.txt
+
+spidev>=3.6,<4.0
+mfrc522>=0.0.7
+RPi.GPIO>=0.7.0
