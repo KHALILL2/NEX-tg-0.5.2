@@ -36,7 +36,7 @@ Environment Variables (see ``config.env.example`` for full list)
 ``GATE_OFFLINE_CACHE_TTL``  Offline cache TTL in seconds (default ``300``).
 ``GATE_HEALTH_PORT``        Health check HTTP port (default ``0`` = off).
 
-Author : Abdullah
+Author : Khalil Muhammad
 License: MIT
 """
 
