@@ -46,7 +46,18 @@ echo "      ✓ venv at $VENV_DIR"
 echo "[3/5] Installing Python packages…"
 "$VENV_DIR/bin/pip" install --upgrade pip -q
 "$VENV_DIR/bin/pip" install -r "$SCRIPT_DIR/requirements.txt" -q
-echo "      ✓ Python packages installed"
+echo "      ✓ Base packages installed"
+
+# If running on a Raspberry Pi, also install hardware-specific deps
+if grep -qi "raspberry" /proc/cpuinfo 2>/dev/null || grep -qi "BCM" /proc/cpuinfo 2>/dev/null; then
+    echo "      Raspberry Pi detected — installing RFID/GPIO packages…"
+    "$VENV_DIR/bin/pip" install -r "$SCRIPT_DIR/requirements-rpi.txt" -q
+    echo "      ✓ RPi packages installed (spidev, mfrc522, RPi.GPIO)"
+    echo "      ℹ  Enable SPI in raspi-config if not already done"
+else
+    echo "      ℹ  Non-RPi system — skipping requirements-rpi.txt"
+    echo "        (install manually on the Pi: pip install -r requirements-rpi.txt)"
+fi
 
 # ── 4. Config file ──────────────────────────────────────────────────────────
 echo "[4/5] Checking config.env…"

@@ -18,17 +18,30 @@
 
 ## Table of Contents
 
+- [Table of Contents](#table-of-contents)
 - [Overview](#overview)
 - [Hardware Setup](#hardware-setup)
+  - [RC522 RFID Connection](#rc522-rfid-connection)
 - [Software Architecture](#software-architecture)
+  - [Key Design Decisions](#key-design-decisions)
 - [Display Layout](#display-layout)
 - [Installation](#installation)
+  - [Quick Install (Raspberry Pi OS)](#quick-install-raspberry-pi-os)
+  - [Manual Install](#manual-install)
 - [Configuration](#configuration)
 - [Running](#running)
+  - [Direct](#direct)
+  - [As a systemd service](#as-a-systemd-service)
 - [Project Structure](#project-structure)
 - [Arduino Protocol](#arduino-protocol)
+  - [Access Granted Sequence](#access-granted-sequence)
+  - [Access Denied Sequence](#access-denied-sequence)
 - [API Contract](#api-contract)
+  - [Request](#request)
+  - [Response — Access Granted (200)](#response--access-granted-200)
+  - [Response — Access Denied (200)](#response--access-denied-200)
 - [Health Check Endpoint](#health-check-endpoint)
+  - [Response](#response)
 - [Security Features](#security-features)
 - [Offline Fallback](#offline-fallback)
 - [Testing](#testing)
@@ -70,8 +83,7 @@ When a student approaches the university turnstile gate:
 > **Note:** The system uses a minimal hardware design:
 > - The RC522 RFID reader connects directly to the Raspberry Pi via SPI
 > - The Arduino serves only as a relay controller for the solenoid lock
-> - No visual indicators (LEDs), audio feedback (buzzers), or position sensing (IR) is used
-> - Gate state is tracked in software, not detected via sensors
+> - Gate state is tracked in software, not detected via physical occupancy sensors
 
 ### RC522 RFID Connection
 
@@ -95,8 +107,8 @@ The RC522 module connects **directly** to the Raspberry Pi GPIO header (SPI bus 
 
 ```
 ┌──────────────┐     USB Serial      ┌──────────────────┐
-│  ATmega /    │◄────────────────────►│  Raspberry Pi 4B │
-│  Arduino     │  GATE:OPEN/CLOSE    │                  │
+│              │◄───────────────────►│  Raspberry Pi 4B │
+│  Arduino     │   OPEN / CLOSE      │                  │
 │              │                     │  gate.py         │
 │              │                     │  (CustomTkinter) │
 └──────┬───────┘                     │                  │
@@ -123,11 +135,11 @@ The RC522 module connects **directly** to the Raspberry Pi GPIO header (SPI bus 
 | **SSL security** | Configurable certificate pinning via `GATE_API_CERT_PATH`. SSL verification enabled by default. |
 | **Arduino reconnection** | Background thread with exponential backoff (2 s → 60 s cap) auto-reconnects on serial loss. |
 | **Duplicate scans** | Configurable debounce window (`CARD_DEBOUNCE_SECONDS`) rejects the same card within N seconds. |
-| **Gate auto-close** | Timer automatically triggers `GATE:CLOSE` after `GATE_OPEN_DURATION` seconds. |
+| **Gate auto-close** | Timer automatically triggers `CLOSE` after `GATE_OPEN_DURATION` seconds. |
 | **Offline fallback** | Optional time-limited cache of successful checks (keyed by hashed UID) ensures passage during API outages. |
 | **Denied display** | Generic Arabic message shown; raw UID never appears on screen. |
 | **Simulation Mode** | Software simulation of RFID reads for UI/API development without physical hardware. |
-| **Configuration** | All values via environment variables. `GATE_API_URL` and `UID_HASH_KEY` are *required*. |
+| **Configuration** | All values via environment variables. Both `GATE_API_URL` and `BASE_MEDIA_URL` default to the production server; `UID_HASH_KEY` should be replaced on the RPi. |
 
 ---
 
@@ -141,27 +153,27 @@ The monitor shows a fullscreen dark-themed interface in Arabic (RTL):
 │         Gate Access Monitoring System                │
 ├──────────────────────────────────────────────────────┤
 │                                                      │
-│  ┌─ Status Badge ──────────────┐  ┌──────────────┐  │
-│  │  ✓ الدخول مسموح             │  │              │  │
-│  └─────────────────────────────┘  │   Student    │  │
-│                                   │    Photo     │  │  Main Card
-│  Student Name (Arabic, large)     │              │  │
-│  Seat Number: 12345               │              │  │
+│  ┌─ Status Badge ──────────────┐  ┌──────────────┐   │
+│  │  ✓ الدخول مسموح            │  │              │   │
+│  └─────────────────────────────┘  │   Student    │   │
+│                                   │    Photo     │   │  Main Card
+│  Student Name (Arabic, large)     │              │   │
+│  Seat Number: 12345               │              │   │
 │  كلية الهندسة                     └──────────────┘  │
-│  تكنولوجيا المعلومات                                 │
+│  تكنولوجيا المعلومات                                │
 │                          ⏰ 12:30:45 PM              │
 │                                                      │
 ├──────────────────────────────────────────────────────┤
-│                                     :آخر الحضور      │
-│  ┌──────────┐  ┌──────────┐  ┌──────────┐           │
-│  │  Photo   │  │  Photo   │  │  Photo   │           │  History
-│  │  ━━━━━━  │  │  ━━━━━━  │  │  ━━━━━━  │           │  (3 cards)
-│  │  Name    │  │  Name    │  │  Name    │           │
-│  │  Seat    │  │  Seat    │  │  Seat    │           │
-│  │  Time    │  │  Time    │  │  Time    │           │
-│  └──────────┘  └──────────┘  └──────────┘           │
+│                                     :آخر الحضور     │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐            │
+│  │  Photo   │  │  Photo   │  │  Photo   │            │  History
+│  │  ━━━━━━  │  │  ━━━━━━  │  │  ━━━━━━  │            │  (3 cards)
+│  │  Name    │  │  Name    │  │  Name    │            │
+│  │  Seat    │  │  Seat    │  │  Seat    │            │
+│  │  Time    │  │  Time    │  │  Time    │            │
+│  └──────────┘  └──────────┘  └──────────┘            │
 ├──────────────────────────────────────────────────────┤
-│  ✓ النظام جاهز - في انتظار مسح البطاقة...           │  Status Bar
+│  ✓ النظام جاهز - في انتظار مسح البطاقة...         │  Status Bar
 └──────────────────────────────────────────────────────┘
 ```
 
@@ -217,8 +229,8 @@ nano config.env
 
 | Variable | Required | Description |
 |---|:---:|---|
-| `GATE_API_URL` | **Yes** | REST API endpoint for access checks |
-| `UID_HASH_KEY` | **Yes** | 32-byte hex string for HMAC-SHA256 hashing of UIDs |
+| `GATE_API_URL` | No | REST API endpoint (default: production server) |
+| `UID_HASH_KEY` | No | 32-byte hex HMAC key — **replace on the RPi** (`openssl rand -hex 32`) |
 | `GATE_API_KEY` | No | Bearer token for API authentication |
 | `GATE_API_UID_FIELD` | No | JSON field for API payload (default `card_uid`) |
 | `GATE_VERIFY_SSL` | No | Enable/disable SSL certificate verification (default `true`) |
@@ -276,21 +288,21 @@ gate-scanner/
 
 ## Arduino Protocol
 
-The RPi communicates with the Arduino Mega over USB serial using a simple text protocol. Each command is a line in `TYPE:VALUE\n` format:
+The RPi communicates with the Arduino over USB serial using plain text commands. Each message is a single line terminated by `\n`:
 
 | Command | Action |
 |---|---|
-| `GATE:OPEN` | Open the gate (unlock solenoid) |
-| `GATE:CLOSE` | Close the gate (lock solenoid) |
+| `OPEN` | Unlock the solenoid (open gate) |
+| `CLOSE` | Lock the solenoid (close gate) |
 
-The Arduino replies with standard acknowledgments like `Gate opened` or `Gate closed`.
+The Arduino replies with acknowledgments such as `Gate opened` or `Gate closed`.
 
 ### Access Granted Sequence
 
 ```
-RPi → GATE:OPEN
+RPi → OPEN
      (wait GATE_OPEN_DURATION seconds)
-RPi → GATE:CLOSE
+RPi → CLOSE
 ```
 
 ### Access Denied Sequence
@@ -413,15 +425,15 @@ pytest tests/ -v --cov=gate --cov-report=term-missing
 
 | Problem | Solution |
 |---|---|
-| **`GATE_API_URL is required`** | Set `GATE_API_URL` in `config.env`. The system no longer has a hardcoded default. |
-| **`UID_HASH_KEY is required`** | Generate a 32-byte hex key (`openssl rand -hex 32`) and add it to `config.env` for secure UID hashing. |
-| **Arduino not connecting** | Check `GATE_SERIAL_PORT` matches `ls /dev/ttyACM*`. The system auto-reconnects — check the header indicator. |
-| **Arduino indicator red** | Serial connection lost. Check cable/port. Auto-reconnection runs with exponential backoff. |
-| **RFID not scanning** | Ensure SPI is enabled in `raspi-config`. Verify wiring matches the RC522 table exactly. |
+| **Gate doesn't open** | Verify your Arduino sketch listens for `OPEN\n` (plain text, no prefix). Check serial port and baud rate (`9600`). |
+| **Arduino not connecting** | Check `GATE_SERIAL_PORT` matches `ls /dev/ttyACM*`. The system auto-reconnects — watch the header indicator. |
+| **Arduino indicator red** | Serial connection lost. Check USB cable and port. Auto-reconnection runs with exponential backoff. |
+| **RFID not scanning** | Ensure SPI is enabled in `raspi-config`. Verify wiring matches the RC522 table above. |
+| **All scans denied** | Check `GATE_API_UID_FIELD` — must match what the backend expects (`card_uid` by default). |
 | **Arabic text garbled** | Install the Amiri font: `sudo apt-get install fonts-amiri` |
 | **GUI not showing** | Ensure `DISPLAY=:0` is set. For SSH: `export DISPLAY=:0` or run via systemd. |
-| **API errors / retries** | Check `~/gate-scanner.log`. Verify `GATE_API_URL`, network, and API key. |
-| **Gate stays open** | Check serial connection and logs. The auto-close timer sends `GATE:CLOSE` after `GATE_OPEN_DURATION`. |
+| **API errors / retries** | Check `~/gate-scanner.log`. Verify API URL, network connectivity, and API key. |
+| **Gate stays open** | Check serial connection and logs. The auto-close timer sends `CLOSE` after `GATE_OPEN_DURATION` seconds. |
 
 ---
 

@@ -127,42 +127,57 @@ def gate_module():
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# validate_barcode()
+# UIDValidator
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
-class TestValidateBarcode:
-    """Tests for the barcode input-validation function."""
+class TestUIDValidator:
+    """Tests for UID validation, normalisation, and hashing."""
 
-    def test_valid_numeric(self, gate_module: types.ModuleType) -> None:
-        assert gate_module.validate_barcode("1234567890") is True
+    def test_validate_valid_4byte(self, gate_module: types.ModuleType) -> None:
+        assert gate_module.UIDValidator.validate(b"\xA3\xB7\xC2\xD4") is True
 
-    def test_valid_alphanumeric(self, gate_module: types.ModuleType) -> None:
-        assert gate_module.validate_barcode("ABC-123_test.01") is True
+    def test_validate_valid_7byte(self, gate_module: types.ModuleType) -> None:
+        assert gate_module.UIDValidator.validate(b"\x01\x02\x03\x04\x05\x06\x07") is True
 
-    def test_empty_string(self, gate_module: types.ModuleType) -> None:
-        assert gate_module.validate_barcode("") is False
+    def test_validate_rejects_wrong_length(self, gate_module: types.ModuleType) -> None:
+        assert gate_module.UIDValidator.validate(b"\x01\x02\x03") is False  # 3 bytes
 
-    def test_too_long(self, gate_module: types.ModuleType) -> None:
-        assert gate_module.validate_barcode("A" * 51) is False
+    def test_validate_rejects_all_zeros_4byte(self, gate_module: types.ModuleType) -> None:
+        assert gate_module.UIDValidator.validate(b"\x00\x00\x00\x00") is False
 
-    def test_exactly_max_length(self, gate_module: types.ModuleType) -> None:
-        assert gate_module.validate_barcode("A" * 50) is True
+    def test_validate_rejects_all_zeros_7byte(self, gate_module: types.ModuleType) -> None:
+        assert gate_module.UIDValidator.validate(b"\x00" * 7) is False
 
-    def test_special_characters_rejected(self, gate_module: types.ModuleType) -> None:
-        assert gate_module.validate_barcode("12345; DROP TABLE") is False
+    def test_normalize(self, gate_module: types.ModuleType) -> None:
+        result = gate_module.UIDValidator.normalize(b"\xA3\xB7\xC2\xD4")
+        assert result == "A3:B7:C2:D4"
 
-    def test_unicode_rejected(self, gate_module: types.ModuleType) -> None:
-        assert gate_module.validate_barcode("مرحبا") is False
+    def test_to_api_format(self, gate_module: types.ModuleType) -> None:
+        result = gate_module.UIDValidator.to_api_format("A3:B7:C2:D4")
+        assert result == "A3B7C2D4"
 
-    def test_newline_rejected(self, gate_module: types.ModuleType) -> None:
-        assert gate_module.validate_barcode("abc\ndef") is False
+    def test_hash_uid_returns_string(self, gate_module: types.ModuleType) -> None:
+        result = gate_module.UIDValidator.hash_uid("A3B7C2D4", "secret-key")
+        assert isinstance(result, str)
+        assert len(result) == 16  # truncated to 16 chars
 
-    def test_html_injection_rejected(self, gate_module: types.ModuleType) -> None:
-        assert gate_module.validate_barcode("<script>alert(1)</script>") is False
+    def test_hash_uid_different_keys(self, gate_module: types.ModuleType) -> None:
+        h1 = gate_module.UIDValidator.hash_uid("A3B7C2D4", "key-one")
+        h2 = gate_module.UIDValidator.hash_uid("A3B7C2D4", "key-two")
+        assert h1 != h2
 
-    def test_backslash_rejected(self, gate_module: types.ModuleType) -> None:
-        assert gate_module.validate_barcode("abc\\def") is False
+    def test_detect_mifare_1k(self, gate_module: types.ModuleType) -> None:
+        ct = gate_module.UIDValidator.detect_card_type(b"\x08")
+        assert ct == gate_module.CardType.MIFARE_1K
+
+    def test_detect_mifare_4k(self, gate_module: types.ModuleType) -> None:
+        ct = gate_module.UIDValidator.detect_card_type(b"\x18")
+        assert ct == gate_module.CardType.MIFARE_4K
+
+    def test_detect_unknown(self, gate_module: types.ModuleType) -> None:
+        ct = gate_module.UIDValidator.detect_card_type(b"\xFF")
+        assert ct == gate_module.CardType.UNKNOWN
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -256,12 +271,12 @@ class TestOfflineCache:
         assert cache.lookup("222") is None
 
     def test_stores_by_hash_not_raw(self, gate_module: types.ModuleType) -> None:
-        """Ensure the cache key is a SHA-256 hash, not the raw barcode."""
+        """Ensure the cache key is a SHA-256 hash, not the raw UID."""
         cache = gate_module.OfflineCache(ttl=60.0, enabled=True)
-        cache.store("secret-barcode", {"name": "Student"})
-        expected_key = hashlib.sha256(b"secret-barcode").hexdigest()
+        cache.store("secret-uid", {"name": "Student"})
+        expected_key = hashlib.sha256(b"secret-uid").hexdigest()
         assert expected_key in cache._cache
-        assert "secret-barcode" not in cache._cache
+        assert "secret-uid" not in cache._cache
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -321,14 +336,14 @@ class TestResolvePhotoUrl:
 class TestGateConfig:
     """Tests for configuration loading and validation."""
 
-    def test_from_env_missing_api_url(self, gate_module: types.ModuleType) -> None:
-        """GATE_API_URL must be set."""
+    def test_from_env_uses_default_api_url(self, gate_module: types.ModuleType) -> None:
+        """When GATE_API_URL is not set, the production default URL is used."""
         import os
         env = os.environ.copy()
         env.pop("GATE_API_URL", None)
         with patch.dict(os.environ, env, clear=True):
-            with pytest.raises(gate_module.GateError, match="GATE_API_URL"):
-                gate_module.GateConfig.from_env()
+            cfg = gate_module.GateConfig.from_env()
+            assert "batu-gate.abdullah.top" in cfg.api_url
 
     def test_from_env_valid(self, gate_module: types.ModuleType) -> None:
         import os
@@ -386,7 +401,6 @@ class TestGateStatus:
         assert "OPEN" in names
         assert "CLOSED" in names
         assert "ERROR" in names
-        assert "OCCUPIED" in names
 
     def test_value_strings(self, gate_module: types.ModuleType) -> None:
         assert gate_module.GateStatus.OPEN.value == "open"

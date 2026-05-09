@@ -5,41 +5,42 @@
 Gate Access Monitoring System — BATU University
 ================================================
 
-A fullscreen kiosk application for the Raspberry Pi 4B that controls a
-university turnstile gate.  It reads student RFID cards, verifies them against
-a remote REST API, and displays student information on an attached monitor.
+Fullscreen kiosk app for the Raspberry Pi 4B. Reads student RFID cards
+via an RC522 reader, checks them against a REST API, and opens the gate
+if access is granted. Everything else — photos, names, history — gets
+displayed on an HDMI monitor.
 
 Hardware
 --------
-- **Raspberry Pi 4B** — runs this script and the display.
-- **Arduino Mega** — controls solenoid lock, servo, LEDs, and buzzers
-  via USB-serial.  Accepts commands in ``TYPE:VALUE`` format
-  (e.g. ``GATE:OPEN``, ``LED:GREEN``, ``BUZZER:RED``).
-- **RFID Reader** — RC522 (via SPI), PN532, or Simulation.
-- **Monitor** — connected via HDMI; shows the CustomTkinter GUI.
+- **Raspberry Pi 4B** — runs this script, drives the display.
+- **RC522 RFID Module** — connected directly to the RPi via SPI.
+- **Arduino Mega** — relay between RPi and solenoid lock. Listens for
+  ``OPEN`` and ``CLOSE`` commands over USB serial at 9600 baud.
+- **Solenoid Lock** — the only physical gate component Arduino controls.
+- **Monitor** — HDMI display for the CustomTkinter GUI.
 
-Environment Variables (see ``config.env.example`` for full list)
------------------------------------------------------------------
-``GATE_API_URL``            API endpoint for access checks (**required**).
-``GATE_API_KEY``            Bearer token sent as ``Authorization`` header.
-``GATE_API_UID_FIELD``      JSON field for the card UID (default ``card_uid``).
+Key environment variables (see ``config.env.example`` for the full list)
+------------------------------------------------------------------------
+``GATE_API_URL``            API endpoint (defaults to the production server).
+``GATE_API_KEY``            Bearer token in the ``Authorization`` header.
+``GATE_API_UID_FIELD``      JSON field name for the UID (default ``card_uid``).
 ``GATE_VERIFY_SSL``         Set ``false`` to disable SSL verification.
-``GATE_API_TIMEOUT``        API request timeout in seconds (default ``8``).
-``GATE_SERIAL_PORT``        Arduino Mega serial port (default ``/dev/ttyACM0``).
-``GATE_BAUD_RATE``          Arduino Mega baud rate  (default ``115200``).
-``RFID_READER_TYPE``        Reader type: ``RC522``, ``PN532``, or ``SIMULATION``.
-``CARD_DEBOUNCE_SECONDS``   Duplicate scan ignore window (default ``3``).
-``UID_HASH_KEY``            HMAC-SHA256 key for hashing UIDs (**required**).
-``SIMULATION_MODE``         Enable fake UID generation (default ``false``).
-``BASE_MEDIA_URL``          Prefix for relative photo URLs.
-``GATE_OFFLINE_MODE``       Enable offline cache fallback (default ``false``).
-
-``GATE_OFFLINE_CACHE_TTL``  Offline cache TTL in seconds (default ``300``).
-``GATE_HEALTH_PORT``        Health check HTTP port (default ``0`` = off).
+``GATE_API_TIMEOUT``        Request timeout in seconds (default ``3``).
+``GATE_SERIAL_PORT``        Arduino serial port (default ``/dev/ttyACM0``).
+``GATE_BAUD_RATE``          Must match the Arduino sketch (default ``9600``).
+``RFID_READER_TYPE``        ``RC522``, ``PN532``, or ``SIMULATION``.
+``CARD_DEBOUNCE_SECONDS``   Ignore the same card within N seconds (default ``3``).
+``UID_HASH_KEY``            32-byte hex HMAC key — replace this on the RPi.
+``SIMULATION_MODE``         Generate fake card reads without hardware.
+``BASE_MEDIA_URL``          Photo URL prefix (defaults to the production server).
+``GATE_OFFLINE_MODE``       Fall back to local cache when the API is down.
+``GATE_OFFLINE_CACHE_TTL``  Offline cache TTL seconds (default ``300``).
+``GATE_HEALTH_PORT``        HTTP health check port (default ``0`` = disabled).
 
 Author : Khalil Muhammad
 License: MIT
 """
+
 
 # ════════════════════
 # IMPORTS
@@ -138,8 +139,7 @@ log = logging.getLogger("gate")
 # ════════════════════════════════════════════════════════════
 
 ARDUINO_CONNECT_DELAY: float = 2.0      # seconds after opening serial
-GATE_CLOSE_DELAY: float = 0.3           # brief pause after GATE:CLOSE
-DENY_SEQUENCE_DURATION: float = 2.0     # seconds LED:RED stays on
+GATE_CLOSE_DELAY: float = 0.3           # brief pause after CLOSE
 STATUS_BAR_RESET_MS: int = 4000         # ms before status bar resets
 CLOCK_UPDATE_MS: int = 1000             # ms between clock ticks
 INDICATOR_UPDATE_MS: int = 2000         # ms between Arduino indicator checks
@@ -245,13 +245,10 @@ class GateConfig:
 
         Raises :class:`GateError` when critical values are missing or invalid.
         """
-        api_url = os.getenv("GATE_API_URL", "").strip()
-        if not api_url:
-            raise GateError(
-                "GATE_API_URL is required but not set.\n"
-                "Set it in config.env or as an environment variable.\n"
-                "Example: GATE_API_URL=https://your-server.com/api/v1/gate/check-access"
-            )
+        api_url = os.getenv(
+            "GATE_API_URL",
+            "https://batu-gate.abdullah.top/api/v1/gate/check-access",
+        ).strip()
 
         api_cert_path = os.getenv("GATE_API_CERT_PATH", "").strip()
         if api_cert_path and not os.path.isfile(api_cert_path):
@@ -279,9 +276,9 @@ class GateConfig:
             api_timeout=float(os.getenv("GATE_API_TIMEOUT", "3.0")),
             api_max_retries=int(os.getenv("GATE_API_MAX_RETRIES", "3")),
             api_retry_delay=float(os.getenv("GATE_API_RETRY_DELAY", "1")),
-            api_uid_field=os.getenv("API_UID_FIELD", "card_uid").strip(),
+            api_uid_field=os.getenv("GATE_API_UID_FIELD", "card_uid").strip(),
             serial_port=os.getenv("GATE_SERIAL_PORT", "/dev/ttyACM0"),
-            baud_rate=int(os.getenv("GATE_BAUD_RATE", "115200")),
+            baud_rate=int(os.getenv("GATE_BAUD_RATE", "9600")),
             rfid_reader_type=os.getenv("RFID_READER_TYPE", "RC522").strip().upper(),
             rc522_rst_pin=int(os.getenv("RC522_RST_PIN", "25")),
             rc522_spi_bus=int(os.getenv("RC522_SPI_BUS", "0")),
@@ -290,8 +287,8 @@ class GateConfig:
             uid_hash_key=os.getenv("UID_HASH_KEY", "change-me-generate-with-openssl"),
             gate_open_duration=gate_open_duration,
             card_debounce_seconds=card_debounce,
-            api_pool_size=int(os.getenv("API_POOL_SIZE", "20")),
-            base_media_url=os.getenv("BASE_MEDIA_URL", "").strip(),
+            api_pool_size=int(os.getenv("GATE_API_POOL_SIZE", "20")),
+            base_media_url=os.getenv("BASE_MEDIA_URL", "https://batu-gate.abdullah.top").strip(),
             offline_mode=_bool_env("GATE_OFFLINE_MODE", False),
             offline_cache_ttl=float(os.getenv("GATE_OFFLINE_CACHE_TTL", "300")),
             health_port=int(os.getenv("GATE_HEALTH_PORT", "0")),
@@ -364,7 +361,6 @@ class GateStatus(enum.Enum):
     CLOSING = "closing"
     CLOSED = "closed"
     ERROR = "error"
-    OCCUPIED = "occupied"  # IR sensor triggered while gate is open
 
 
 # ════════════════════
@@ -761,31 +757,20 @@ class GateController:
     Arduino Mega Pin Layout::
 
         Pin 22  →  Solenoid Relay (Active HIGH)
-        Pin 24  →  Servo Relay (Active LOW)
-        Pin 26  →  IR Sensor (gate occupancy)
-        Pin 28  →  Green LED + Buzzer
-        Pin 30  →  Red LED + Buzzer
-        I2C     →  PCA9685 Servo Driver
 
     Features
     --------
     - Thread-safe command sending.
     - **Automatic reconnection** with exponential backoff when disconnected.
     - Background reader thread that parses Arduino status messages
-      (``STATUS:*``, ``IR:*``, ``EMERGENCY:*``, acknowledgements).
+      (``STATUS:*``, ``EMERGENCY:*``, acknowledgements).
     - Gate state tracking via :class:`GateStatus`.
-    - Proactive status polling via ``GATE:STATUS`` command.
-    - Graceful shutdown (sends ``GATE:CLOSE`` + ``LED:OFF``).
+    - Graceful shutdown (sends ``CLOSE`` to lock the solenoid before exit).
 
-    The controller speaks the ``TYPE:VALUE\\n`` protocol::
+    The controller sends plain-text commands over USB serial::
 
-        GATE:OPEN    — unlock solenoid + open servo
-        GATE:CLOSE   — close servo + lock solenoid
-        GATE:STATUS  — request current gate status
-        LED:GREEN    — green LED on (red off)
-        LED:RED      — red LED on (green off)
-        LED:OFF      — all LEDs off
-        BUZZER:GREEN / BUZZER:RED — short beep
+        OPEN    — unlock solenoid (gate opens)
+        CLOSE   — lock solenoid  (gate closes)
     """
 
     def __init__(self, config: GateConfig) -> None:
@@ -826,8 +811,7 @@ class GateController:
         """Send safe-state commands and close the serial port."""
         log.info("GateController shutting down…")
         self._shutdown.set()
-        self.send_command("GATE:CLOSE")
-        self.send_command("LED:OFF")
+        self.send_command("CLOSE")
         with self._write_lock:
             if self._serial and self._serial.is_open:
                 try:
@@ -867,18 +851,14 @@ class GateController:
         """
         Full "access granted" hardware sequence (runs in a daemon thread):
 
-        1. Green LED + buzzer beep
-        2. Open gate  (with timeout-based OPEN confirmation check)
-        3. Wait ``gate_open_duration`` seconds
-        4. Close gate
-        5. LEDs off
+        1. Open gate  (with timeout-based OPEN confirmation check)
+        2. Wait ``gate_open_duration`` seconds
+        3. Close gate
         """
         def _run() -> None:
             self._set_gate_status(GateStatus.OPENING)
-            self.send_command("LED:GREEN")
-            self.send_command("BUZZER:GREEN")
 
-            ok = self.send_command("GATE:OPEN")
+            ok = self.send_command("OPEN")
             if ok:
                 # Wait briefly for the Arduino to acknowledge OPEN
                 deadline = time.monotonic() + GATE_OPEN_CONFIRM_TIMEOUT
@@ -892,31 +872,20 @@ class GateController:
                     log.debug("Gate OPEN not confirmed within timeout — proceeding")
             else:
                 self._set_gate_status(GateStatus.ERROR)
-                log.error("GATE:OPEN command failed — possible hardware issue")
+                log.error("OPEN command failed — possible hardware issue")
 
             time.sleep(self._config.gate_open_duration)
 
             self._set_gate_status(GateStatus.CLOSING)
-            self.send_command("GATE:CLOSE")
+            self.send_command("CLOSE")
             time.sleep(GATE_CLOSE_DELAY)
-            self.send_command("LED:OFF")
             self._set_gate_status(GateStatus.CLOSED)
 
         threading.Thread(target=_run, daemon=True, name="grant-seq").start()
 
     def deny_access_sequence(self) -> None:
-        """
-        Full "access denied" hardware sequence (runs in a daemon thread):
-
-        Red LED + buzzer, wait 2 s, LEDs off.
-        """
-        def _run() -> None:
-            self.send_command("LED:RED")
-            self.send_command("BUZZER:RED")
-            time.sleep(DENY_SEQUENCE_DURATION)
-            self.send_command("LED:OFF")
-
-        threading.Thread(target=_run, daemon=True, name="deny-seq").start()
+        """No hardware action on deny. UI callback handles the visual update."""
+        pass  # Gate does NOT open; display already shows denied state.
 
     # ── background loop (reader + reconnection) ──────────────────────────────
 
@@ -998,15 +967,10 @@ class GateController:
 
         upper = msg.upper()
 
-        # STATUS:* — gate/sensor status reports
+        # STATUS:* — gate status reports
         if upper.startswith("STATUS:"):
             value = upper.split(":", 1)[1].strip()
-            if value == "OCCUPIED":
-                self._set_gate_status(GateStatus.OCCUPIED)
-            elif value == "CLEAR":
-                if self.gate_status == GateStatus.OCCUPIED:
-                    self._set_gate_status(GateStatus.CLOSED)
-            elif value == "OPEN":
+            if value == "OPEN":
                 self._set_gate_status(GateStatus.OPEN)
             elif value == "CLOSED":
                 self._set_gate_status(GateStatus.CLOSED)
@@ -1014,28 +978,10 @@ class GateController:
                 self._set_gate_status(GateStatus.ERROR)
                 log.error("Arduino reports gate ERROR")
 
-        # IR:* — infrared sensor events
-        elif upper.startswith("IR:"):
-            value = upper.split(":", 1)[1].strip()
-            if value == "BLOCKED":
-                self._set_gate_status(GateStatus.OCCUPIED)
-            elif value == "CLEAR":
-                if self.gate_status == GateStatus.OCCUPIED:
-                    self._set_gate_status(GateStatus.CLOSED)
-
         # EMERGENCY:* — hardware emergency events
         elif upper.startswith("EMERGENCY:"):
             log.critical("EMERGENCY from Arduino: %s", msg)
             self._set_gate_status(GateStatus.ERROR)
-
-        # Legacy GATE_STATUS:* format (backward compatibility)
-        elif upper.startswith("GATE_STATUS:"):
-            value = upper.split(":", 1)[1].strip()
-            if value == "OCCUPIED":
-                self._set_gate_status(GateStatus.OCCUPIED)
-            elif value == "CLEAR":
-                if self.gate_status == GateStatus.OCCUPIED:
-                    self._set_gate_status(GateStatus.CLOSED)
 
         # Acknowledgement keywords
         elif "opened" in msg.lower():
@@ -1333,9 +1279,9 @@ class HealthCheckServer:
             self._server.shutdown()
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════
 # ARABIC TEXT HELPER
-# ═══════════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════
 
 
 def reshape_arabic(text: str) -> str:
@@ -1354,9 +1300,9 @@ def reshape_arabic(text: str) -> str:
         return text
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════
 # PHOTO LOADING HELPERS
-# ═══════════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════
 
 
 def _crop_and_resize(
@@ -1412,9 +1358,9 @@ def resolve_photo_url(url: str, base: str) -> str:
     return url or ""
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════════════════════
 # MAIN STUDENT CARD — the large card shown at the top of the screen
-# ═══════════════════════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════════════════════
 
 
 class MainStudentCard(ctk.CTkFrame):
@@ -1588,9 +1534,9 @@ class MainStudentCard(ctk.CTkFrame):
             lbl.configure(text="")
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════════════════════
 # SMALL STUDENT CARD — history row at the bottom (previous entries)
-# ═══════════════════════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════════════════════
 
 
 class SmallStudentCard(ctk.CTkFrame):
@@ -1717,9 +1663,9 @@ class SmallStudentCard(ctk.CTkFrame):
             log.debug("Small card photo display error: %s", exc)
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════
 # HIGH-THROUGHPUT PROCESSOR — optimised for 6 000 students / day
-# ═══════════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════
 
 
 class HighThroughputProcessor:
@@ -1974,9 +1920,9 @@ class HighThroughputProcessor:
         ) if lats else 0.0
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# ════════════════════
 # MAIN APPLICATION
-# ═══════════════════════════════════════════════════════════════════════════════
+# ════════════════════
 
 
 class GateApp(ctk.CTk):
@@ -2043,9 +1989,9 @@ class GateApp(ctk.CTk):
         self._processor.start()
         log.info("GUI started — waiting for RFID scans")
 
-    # ═════════════════════════════════════════════════════════════════════════
+    # ════════════════════
     # UI CONSTRUCTION
-    # ═════════════════════════════════════════════════════════════════════════
+    # ════════════════════
 
     def _build_header(self) -> None:
         """University branding header with logo, title, Arduino indicator, and clock."""
@@ -2148,9 +2094,9 @@ class GateApp(ctk.CTk):
         )
         self._status_label.pack(expand=True)
 
-    # ═════════════════════════════════════════════════════════════════════════
+    # ════════════════════
     # PERIODIC UI UPDATES
-    # ═════════════════════════════════════════════════════════════════════════
+    # ════════════════════
 
     def _tick_clock(self) -> None:
         """Update the header clock every second."""
@@ -2239,9 +2185,9 @@ class GateApp(ctk.CTk):
             text_color=Colors.GREEN,
         )
 
-    # ═════════════════════════════════════════════════════════════════════════
+    # ═════════════════════════════════
     # THREAD-SAFE UI CALLBACK
-    # ═════════════════════════════════════════════════════════════════════════
+    # ═════════════════════════════════
 
     def _schedule_push_entry(
         self, student: dict[str, Any], status: str,
@@ -2250,9 +2196,9 @@ class GateApp(ctk.CTk):
         self.after(0, lambda s=student, st=status: self._push_entry(s, st))
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════
 # RFID READER FACTORY
-# ═══════════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════
 
 
 def _create_rfid_reader(config: GateConfig) -> RFIDReaderBase:
@@ -2288,9 +2234,9 @@ def _create_rfid_reader(config: GateConfig) -> RFIDReaderBase:
     return reader
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# ═════════════════
 # ENTRY POINT
-# ═══════════════════════════════════════════════════════════════════════════════
+# ═════════════════
 
 if __name__ == "__main__":
     log.info("══════════════════════════════════════════════════")

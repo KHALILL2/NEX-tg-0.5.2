@@ -40,6 +40,9 @@ config.env
 
 # ─── Temporary / one-off scripts ──────────────────────────
 truncate_gate.py
+scratch_*.py
+*.bak
+*.tmp
 
 # ─── Test artefacts ───────────────────────────────────────
 .pytest_cache/
