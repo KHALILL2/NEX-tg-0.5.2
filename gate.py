@@ -276,7 +276,7 @@ class GateConfig:
             api_timeout=float(os.getenv("GATE_API_TIMEOUT", "3.0")),
             api_max_retries=int(os.getenv("GATE_API_MAX_RETRIES", "3")),
             api_retry_delay=float(os.getenv("GATE_API_RETRY_DELAY", "1")),
-            api_uid_field=os.getenv("GATE_API_UID_FIELD", "card_uid").strip(),
+            api_uid_field=os.getenv("GATE_API_UID_FIELD", "bar_code").strip(),
             serial_port=os.getenv("GATE_SERIAL_PORT", "/dev/ttyACM0"),
             baud_rate=int(os.getenv("GATE_BAUD_RATE", "9600")),
             rfid_reader_type=os.getenv("RFID_READER_TYPE", "RC522").strip().upper(),
@@ -327,9 +327,9 @@ class Colors:
     DOT_CLEAR: str = "#334155"
 
 
-# ════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════
 # TRANSLATION TABLES — English slug → Arabic display name
-# ════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════
 
 # cspell:disable
 COLLEGE_NAMES: dict[str, str] = {
@@ -347,9 +347,9 @@ DEPARTMENT_NAMES: dict[str, str] = {
 }
 # cspell:enable
 
-# ════════════════════════════════════════════════════════════
+# ═══════════════════════════
 # GATE STATUS ENUM
-# ════════════════════════════════════════════════════════════
+# ═══════════════════════════
 
 
 class GateStatus(enum.Enum):
@@ -454,11 +454,29 @@ class UIDValidator:
 
     @staticmethod
     def to_api_format(uid: str) -> str:
-        """Remove separators for API transmission.
+        """Remove separators for hex transmission.
 
         Example: ``'A3:B7:C2:D4'`` → ``'A3B7C2D4'``
+
+        .. note::
+            The API expects a **decimal** value — use :meth:`to_decimal`
+            for the actual API payload.
         """
         return uid.replace(":", "").upper()
+
+    @staticmethod
+    def to_decimal(uid_bytes: bytes) -> str:
+        """Convert UID bytes to a decimal integer string for the API.
+
+        The API was originally built around numeric barcode IDs.
+        RFID UIDs are sent as the equivalent decimal value of the
+        big-endian unsigned integer formed by the UID bytes.
+
+        Example: ``b'\\xa3\\xb7\\xc2\\xd4'`` → ``'2747777748'``
+        """
+        return str(int.from_bytes(uid_bytes, byteorder="big"))
+
+
 
     @staticmethod
     def hash_uid(uid: str, secret_key: str) -> str:
@@ -483,6 +501,31 @@ class UIDValidator:
         if sak_val == 0x00:
             return CardType.MIFARE_ULTRALIGHT
         return CardType.UNKNOWN
+
+
+
+# ════════════════════════════════════════════════════════════
+# MANUAL UID INPUT HELPER
+# ════════════════════════════════════════════════════════════
+
+
+def _parse_uid_input(raw: str) -> Optional[bytes]:
+    """Parse a user-typed UID string into bytes.
+
+    Accepted formats (4-byte UIDs only):
+      - Colon-separated hex : ``A3:B7:C2:D4``
+      - Plain hex           : ``A3B7C2D4`` or ``a3b7c2d4``
+      - Space-separated     : ``A3 B7 C2 D4``
+
+    Returns ``bytes`` on success, ``None`` if the input is invalid.
+    """
+    cleaned = raw.strip().replace(":", "").replace(" ", "").replace("-", "")
+    if len(cleaned) != 8:  # 4 bytes = 8 hex chars
+        return None
+    try:
+        return bytes.fromhex(cleaned)
+    except ValueError:
+        return None
 
 
 # ════════════════════════════════════════════════════════════
@@ -576,7 +619,7 @@ class RC522Reader(RFIDReaderBase):
             atqa = bytes([tag_type]) if isinstance(tag_type, int) else b"\x00"
             sak = bytes([raw_uid[4]]) if len(raw_uid) > 4 else b"\x00"
 
-            return RFIDCard(
+            card = RFIDCard(
                 uid=UIDValidator.normalize(uid_bytes),
                 uid_bytes=uid_bytes,
                 card_type=UIDValidator.detect_card_type(sak),
@@ -584,9 +627,20 @@ class RC522Reader(RFIDReaderBase):
                 sak=sak,
                 read_timestamp=time.monotonic(),
             )
+
+            # Put the card to sleep so it won't respond to REQIDL again
+            # until physically removed and re-tapped. Without this the card
+            # cycles back to IDLE state after ~1 s and gets re-processed.
+            try:
+                self._reader.MFRC522_StopCrypto1()
+            except Exception:
+                pass
+
+            return card
         except Exception as exc:
             log.debug("RC522 read error: %s", exc)
             return None
+
 
     def reset(self) -> None:
         if self._reader is not None:
@@ -700,49 +754,40 @@ class SimulationReader(RFIDReaderBase):
 
 
 class CardDetectionManager:
-    """Tracks card-in-field state to avoid processing the same card twice.
+    """Prevents the same card from being processed more than once per debounce window.
 
-    Only returns ``True`` for **new** card presentations.  A card must
-    leave the field before it can be processed again.  Includes a
-    configurable debounce time for rapid tap protection.
+    Uses per-UID timestamps instead of field-state tracking. This is more
+    reliable with MIFARE readers because MFRC522_Request(REQIDL) only sees
+    cards in IDLE state — after one read the card enters ACTIVE, briefly
+    vanishes from the reader's perspective, then returns to IDLE. Field-state
+    tracking would incorrectly reset and allow repeat processing. Time-based
+    debouncing ignores all of that and simply enforces a minimum gap between
+    processing the same UID.
     """
 
-    def __init__(self, debounce_seconds: float = 0.5) -> None:
-        self._current_uid: Optional[str] = None
-        self._card_in_field: bool = False
-        self._last_process_time: float = 0.0
-        self._debounce: float = debounce_seconds
+    def __init__(self, debounce_seconds: float = 3.0) -> None:
+        self._debounce = debounce_seconds
+        self._uid_times: dict[str, float] = {}
         self._lock = threading.Lock()
 
     def should_process(self, card: RFIDCard) -> bool:
-        """Return ``True`` only if *card* is a new presentation."""
+        """Return True only if this UID hasn't been processed within the debounce window."""
         with self._lock:
             now = time.monotonic()
-
-            # Same card still in field — ignore
-            if self._card_in_field and card.uid == self._current_uid:
+            last = self._uid_times.get(card.uid, 0.0)
+            if now - last < self._debounce:
                 return False
-
-            # Different card or card returned — check debounce
-            if now - self._last_process_time < self._debounce:
-                return False
-
-            self._current_uid = card.uid
-            self._card_in_field = True
-            self._last_process_time = now
+            self._uid_times[card.uid] = now
             return True
 
     def card_removed(self) -> None:
-        """Signal that no card is currently in the field."""
-        with self._lock:
-            self._card_in_field = False
+        """No-op — kept for API compatibility. Field tracking is no longer used."""
 
     def force_reset(self) -> None:
-        """Force-reset state (call after errors to avoid stuck state)."""
+        """Clear all debounce state (call after reader errors to avoid stuck UIDs)."""
         with self._lock:
-            self._current_uid = None
-            self._card_in_field = False
-            self._last_process_time = 0.0
+            self._uid_times.clear()
+
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1744,7 +1789,41 @@ class HighThroughputProcessor:
         self._session.close()
         self._reader.cleanup()
 
-    # ── detection loop ────────────────────────────────────────────────────────
+    def inject_uid(self, uid_str: str) -> bool:
+        """Inject a manually entered UID directly into the processing queue.
+
+        Accepts hex strings in any common format: ``A3B7C2D4``,
+        ``A3:B7:C2:D4``, or ``a3 b7 c2 d4``. Bypasses the debounce
+        manager so the same card can be submitted multiple times from
+        the terminal or GUI without waiting for the debounce window.
+
+        Returns ``True`` if the card was queued, ``False`` on bad input
+        or a full queue.
+        """
+        uid_bytes = _parse_uid_input(uid_str)
+        if uid_bytes is None:
+            log.warning("[MANUAL] Invalid UID format: '%s'", uid_str)
+            return False
+        if not UIDValidator.validate(uid_bytes):
+            log.warning("[MANUAL] UID failed validation: '%s'", uid_str)
+            return False
+        card = RFIDCard(
+            uid=UIDValidator.normalize(uid_bytes),
+            uid_bytes=uid_bytes,
+            card_type=CardType.UNKNOWN,
+            atqa=b"\x00\x00",
+            sak=b"\x00",
+            read_timestamp=time.monotonic(),
+        )
+        log.info("[MANUAL] Injecting card UID %s", card.uid)
+        try:
+            self._queue.put_nowait(card)
+            return True
+        except queue.Full:
+            log.warning("[MANUAL] Queue full — card dropped")
+            return False
+
+
 
     def _detection_loop(self) -> None:
         """Poll the RFID reader; enqueue new cards for processing."""
@@ -1803,8 +1882,13 @@ class HighThroughputProcessor:
         _health_state["total_scans"] += 1
         _health_state["last_scan_time"] = start
 
-        uid_api = UIDValidator.to_api_format(card.uid)
+        # Convert UID bytes → decimal string (what the API expects).
+        # The API was built around numeric barcode IDs, so e.g. bytes
+        # [0xA3, 0xB7, 0xC2, 0xD4] become "2747777748".
+        uid_api = UIDValidator.to_decimal(card.uid_bytes)
         uid_hash = UIDValidator.hash_uid(card.uid, self._config.uid_hash_key)
+        log.debug("Card UID decimal=%s hash=%s", uid_api, uid_hash)
+
 
         ssl_verify = self._config.ssl_verify
         max_retries = self._config.api_max_retries
@@ -1987,7 +2071,9 @@ class GateApp(ctk.CTk):
             ui_callback=self._schedule_push_entry,
         )
         self._processor.start()
+        self.bind("<Control-m>", lambda _e: self._show_manual_input_dialog())
         log.info("GUI started — waiting for RFID scans")
+
 
     # ════════════════════
     # UI CONSTRUCTION
@@ -2047,6 +2133,19 @@ class GateApp(ctk.CTk):
             text_color=Colors.MUTED_TEXT,
         )
         self._arduino_label.pack(side="right", padx=(0, 10))
+
+        # Manual input button — opens a dialog for typing a card UID
+        ctk.CTkButton(
+            hc,
+            text="⌨",
+            width=44,
+            height=44,
+            corner_radius=8,
+            fg_color=Colors.TIME_BG,
+            hover_color=Colors.CARD_BORDER,
+            font=ctk.CTkFont(size=22),
+            command=self._show_manual_input_dialog,
+        ).pack(side="right", padx=(0, 12))
 
     def _build_content(self) -> None:
         """Main content area: big card + history row."""
@@ -2195,6 +2294,36 @@ class GateApp(ctk.CTk):
         """Schedule ``_push_entry`` on the Tk main thread (thread-safe)."""
         self.after(0, lambda s=student, st=status: self._push_entry(s, st))
 
+    # ═════════════════════════════════
+    # MANUAL UID INPUT
+    # ═════════════════════════════════
+
+    def _show_manual_input_dialog(self) -> None:
+        """Open a dialog to manually enter a card UID.
+
+        Useful for testing without a physical card, or for overriding
+        access during maintenance. The entered UID goes through the same
+        API verification pipeline as a real scan.
+
+        Keyboard shortcut: Ctrl+M.
+        """
+        dialog = ctk.CTkInputDialog(
+            text="Enter card UID and press OK.\n\nFormats: A3B7C2D4  or  A3:B7:C2:D4",
+            title="Manual Card Entry",
+        )
+        uid_str = dialog.get_input()
+        if not uid_str or not uid_str.strip():
+            return
+
+        ok = self._processor.inject_uid(uid_str.strip())
+        if not ok:
+            self._status_label.configure(
+                text=f"Invalid UID: {uid_str.strip()!r}  (expected 8 hex chars)",
+                text_color=Colors.ORANGE,
+            )
+            self.after(STATUS_BAR_RESET_MS, self._reset_status_bar)
+
+
 
 # ═══════════════════════════
 # RFID READER FACTORY
@@ -2290,8 +2419,44 @@ if __name__ == "__main__":
 
     # ── Launch the GUI ────────────────────────────────────────────────────────
     app = GateApp(cfg, gate_ctrl, rfid_reader)
+
+    # ── Terminal manual input thread ──────────────────────────────────────────
+    def _stdin_reader(processor: HighThroughputProcessor) -> None:
+        """Read UIDs typed in the terminal and inject them for processing."""
+        sys.stdout.write(
+            "\n[Manual Input] Type a card UID and press Enter to simulate a scan.\n"
+            "[Manual Input] Formats: A3B7C2D4  or  A3:B7:C2:D4\n\n"
+        )
+        sys.stdout.flush()
+        while True:
+            try:
+                raw = input()
+                if not raw.strip():
+                    continue
+                ok = processor.inject_uid(raw.strip())
+                msg = (
+                    f"[Manual Input] Queued: {raw.strip()}\n"
+                    if ok
+                    else f"[Manual Input] Invalid UID: {raw.strip()!r}  (expected 8 hex chars)\n"
+                )
+                sys.stdout.write(msg)
+                sys.stdout.flush()
+            except EOFError:
+                # stdin closed — happens when running via systemd / nohup
+                break
+            except Exception:
+                break
+
+    threading.Thread(
+        target=_stdin_reader,
+        args=(app._processor,),
+        daemon=True,
+        name="stdin-manual",
+    ).start()
+
     try:
         app.mainloop()
+
     finally:
         log.info("Shutting down…")
         if hasattr(app, "_processor"):
