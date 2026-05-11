@@ -23,7 +23,7 @@ Key environment variables (see ``config.env.example`` for the full list)
 ------------------------------------------------------------------------
 ``GATE_API_URL``            API endpoint (defaults to the production server).
 ``GATE_API_KEY``            Bearer token in the ``Authorization`` header.
-``GATE_API_UID_FIELD``      JSON field name for the UID (default ``card_uid``).
+``GATE_API_UID_FIELD``      JSON field name for the UID (default ``bar_code``).
 ``GATE_VERIFY_SSL``         Set ``false`` to disable SSL verification.
 ``GATE_API_TIMEOUT``        Request timeout in seconds (default ``3``).
 ``GATE_SERIAL_PORT``        Arduino serial port (default ``/dev/ttyACM0``).
@@ -247,7 +247,7 @@ class GateConfig:
         """
         api_url = os.getenv(
             "GATE_API_URL",
-            "https://batu-gate.abdullah.top/api/v1/gate/check-access",
+            "https://batu-gate.alnzam.online/api/v1/gate/check-access",
         ).strip()
 
         api_cert_path = os.getenv("GATE_API_CERT_PATH", "").strip()
@@ -288,7 +288,7 @@ class GateConfig:
             gate_open_duration=gate_open_duration,
             card_debounce_seconds=card_debounce,
             api_pool_size=int(os.getenv("GATE_API_POOL_SIZE", "20")),
-            base_media_url=os.getenv("BASE_MEDIA_URL", "https://batu-gate.abdullah.top").strip(),
+            base_media_url=os.getenv("BASE_MEDIA_URL", "https://batu-gate.alnzam.online").strip(),
             offline_mode=_bool_env("GATE_OFFLINE_MODE", False),
             offline_cache_ttl=float(os.getenv("GATE_OFFLINE_CACHE_TTL", "300")),
             health_port=int(os.getenv("GATE_HEALTH_PORT", "0")),
@@ -619,8 +619,31 @@ class RC522Reader(RFIDReaderBase):
             atqa = bytes([tag_type]) if isinstance(tag_type, int) else b"\x00"
             sak = bytes([raw_uid[4]]) if len(raw_uid) > 4 else b"\x00"
 
+            # ---------------------------------------------------------
+            # Read Sector 1, Block 4 for Programmed Student ID
+            # ---------------------------------------------------------
+            student_id = None
+            try:
+                self._reader.MFRC522_SelectTag(raw_uid)
+                default_key = [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]
+                # Authenticate Block 4
+                status = self._reader.MFRC522_Auth(self._reader.PICC_AUTHENT1A, 4, default_key, raw_uid)
+                if status == self._reader.MI_OK:
+                    block_data = self._reader.MFRC522_Read(4)
+                    if block_data:
+                        # Convert bytes back to string and strip null bytes
+                        parsed_str = bytes(block_data).partition(b'\x00')[0].decode('ascii', errors='ignore')
+                        if parsed_str.isdigit() and len(parsed_str) > 3:
+                            student_id = parsed_str
+            except Exception as auth_exc:
+                log.debug("Block 4 read failed: %s", auth_exc)
+
+            # If a student ID was programmed, use it. Otherwise, fallback to the
+            # decimal representation of the factory UID for the API.
+            final_uid = student_id if student_id else UIDValidator.to_decimal(uid_bytes)
+
             card = RFIDCard(
-                uid=UIDValidator.normalize(uid_bytes),
+                uid=final_uid,
                 uid_bytes=uid_bytes,
                 card_type=UIDValidator.detect_card_type(sak),
                 atqa=atqa,
@@ -1882,12 +1905,11 @@ class HighThroughputProcessor:
         _health_state["total_scans"] += 1
         _health_state["last_scan_time"] = start
 
-        # Convert UID bytes → decimal string (what the API expects).
-        # The API was built around numeric barcode IDs, so e.g. bytes
-        # [0xA3, 0xB7, 0xC2, 0xD4] become "2747777748".
-        uid_api = UIDValidator.to_decimal(card.uid_bytes)
+        # The UID is now either the programmed student seat number (e.g., '2420407')
+        # or the fallback decimal conversion of the hardware UID bytes.
+        uid_api = card.uid
         uid_hash = UIDValidator.hash_uid(card.uid, self._config.uid_hash_key)
-        log.debug("Card UID decimal=%s hash=%s", uid_api, uid_hash)
+        log.debug("Card UID decimal/student_id=%s hash=%s", uid_api, uid_hash)
 
 
         ssl_verify = self._config.ssl_verify

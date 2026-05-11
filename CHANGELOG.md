@@ -11,13 +11,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 ### ⚠️ Breaking Changes
 
 - **Arduino protocol changed**: The serial commands are now plain `OPEN\n` and `CLOSE\n`. Previous firmware using `GATE:OPEN` / `GATE:CLOSE` must be updated.
-- **`GATE_API_URL` is now optional**: Defaults to the production server (`https://batu-gate.abdullah.top/api/v1/gate/check-access`). Override by setting the env var.
-- **API payload field changed**: The card identifier is now sent as `card_uid` instead of `bar_code`. Coordinated with the backend team.
+- **`GATE_API_URL` is now optional**: Defaults to the production server (`https://batu-gate.alnzam.online/api/v1/gate/check-access`). Override by setting the env var.
+- **API payload field reverted**: The card identifier is sent as `bar_code`, matching the legacy barcode system, avoiding backend changes.
+- **MIFARE Smart Card Provisioning**: Introduced `write_card.py` to write 7-digit student IDs directly into Sector 1 Block 4 of MIFARE 1K cards.
+- **Smart Card Auto-Detection**: `RC522Reader` now reads programmed memory blocks and falls back to raw UID automatically.
 
 ### Added
 
 - **RFID/NFC support** — Replaced USB barcode scanner with RC522 RFID module (SPI). Supports MIFARE 1K Classic cards. PN532 support planned for a future release.
-- **`UIDValidator` class** — Validates raw UID bytes (length, all-zero rejection), normalises to colon-separated hex (`A3:B7:C2:D4`), converts to API format (`A3B7C2D4`), and HMAC-SHA256 hashes UIDs so raw values are never stored or logged.
+- **`write_card.py` tool** — Administrator utility to program blank cards.
 - **`HighThroughputProcessor`** — Producer-consumer thread pipeline decouples RFID polling from the GUI thread. Supports 6,000+ students/day (8–13 scans/min peak) with <1.5 s end-to-end latency.
 - **`RFIDReaderBase` strategy pattern** — Swappable reader backends: `RC522Reader`, `PN532Reader` (stub), `SimulationReader`.
 - **Simulation mode** — `SIMULATION_MODE=true` generates fake UIDs at configurable intervals (default 3 s) with a realistic scenario mix (80 % granted, 15 % denied, 5 % error). All simulated reads are marked `[SIMULATION]` in logs.

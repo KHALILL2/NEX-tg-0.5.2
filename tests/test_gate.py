@@ -343,7 +343,7 @@ class TestGateConfig:
         env.pop("GATE_API_URL", None)
         with patch.dict(os.environ, env, clear=True):
             cfg = gate_module.GateConfig.from_env()
-            assert "batu-gate.abdullah.top" in cfg.api_url
+            assert "batu-gate.alnzam.online" in cfg.api_url
 
     def test_from_env_valid(self, gate_module: types.ModuleType) -> None:
         import os

@@ -55,17 +55,33 @@
 When a student approaches the university turnstile gate:
 
 1. **RC522 RFID Module** reads the student's ID card.
-2. **Raspberry Pi 4B** validates the input, then sends the UID to a remote REST API for verification (with automatic retry on transient failures).
-3. If **access is granted**:
+2. **Raspberry Pi 4B** reads the card. It automatically detects if the card has been programmed with a Student ID in its memory sector (via `write_card.py`) or falls back to the factory UID.
+3. The RPi sends the extracted ID (e.g. `2420407`) to the remote REST API for verification.
+4. If **access is granted**:
    - The monitor displays the student's photo, name, seat number, college, and department with a green "Access Granted" badge.
    - The Arduino unlocks the solenoid lock.
    - After a configurable delay, the Arduino re-locks the solenoid.
    - The result is cached locally for offline fallback (if enabled).
-4. If **access is denied**:
+5. If **access is denied**:
    - The monitor shows a red "Access Denied" badge (never exposing the raw card UID).
    - No gate action occurs.
-5. Previous scans are shown in a history row at the bottom of the screen.
-6. If the API is unreachable and offline mode is enabled, recently-verified students can still pass through.
+6. Previous scans are shown in a history row at the bottom of the screen.
+7. If the API is unreachable and offline mode is enabled, recently-verified students can still pass through.
+
+---
+
+## 📇 Smart Card Provisioning (`write_card.py`)
+
+Because the university backend API strictly requires a 7-digit student seat number (e.g., `2420407`) and cannot be modified to accept random factory hardware UIDs (like `2802268419`), this system utilizes the writable flash memory inside standard MIFARE 1K cards.
+
+Before handing a card to a student, an administrator must provision it:
+
+1. Run `python3 write_card.py` on the Raspberry Pi terminal.
+2. Enter the student's seat number when prompted (e.g., `2420407`).
+3. Tap the blank MIFARE card to the reader.
+4. The script securely authenticates with the card and permanently writes the seat number into **Sector 1, Block 4**.
+
+When the student taps the gate, `gate.py` will read Block 4 and send exactly `2420407` to the API, perfectly mimicking a barcode scanner.
 
 ---
 
@@ -232,7 +248,7 @@ nano config.env
 | `GATE_API_URL` | No | REST API endpoint (default: production server) |
 | `UID_HASH_KEY` | No | 32-byte hex HMAC key — **replace on the RPi** (`openssl rand -hex 32`) |
 | `GATE_API_KEY` | No | Bearer token for API authentication |
-| `GATE_API_UID_FIELD` | No | JSON field for API payload (default `card_uid`) |
+| `GATE_API_UID_FIELD` | No | JSON field for API payload (default `bar_code`) |
 | `GATE_VERIFY_SSL` | No | Enable/disable SSL certificate verification (default `true`) |
 | `GATE_SERIAL_PORT` | No | Arduino Mega serial port (default `/dev/ttyACM0`) |
 | `RFID_READER_TYPE` | No | `RC522`, `PN532`, or `SIMULATION` (default `RC522`) |
@@ -270,6 +286,7 @@ Press **Esc** or **Alt+F4** to exit fullscreen (development only).
 ```
 gate-scanner/
 ├── gate.py                 # Main application (GUI + RFID processor + gate control)
+├── write_card.py           # Utility to write student IDs into MIFARE card memory
 ├── requirements.txt        # Base Python dependencies
 ├── requirements-rpi.txt    # RPi-specific hardware deps (spidev, mfrc522)
 ├── config.env.example      # Environment variable template
@@ -321,7 +338,7 @@ Content-Type: application/json
 Authorization: Bearer <GATE_API_KEY>
 
 {
-    "card_uid": "0x1A2B3C4D"
+    "bar_code": "2420407"
 }
 ```
 
@@ -429,7 +446,7 @@ pytest tests/ -v --cov=gate --cov-report=term-missing
 | **Arduino not connecting** | Check `GATE_SERIAL_PORT` matches `ls /dev/ttyACM*`. The system auto-reconnects — watch the header indicator. |
 | **Arduino indicator red** | Serial connection lost. Check USB cable and port. Auto-reconnection runs with exponential backoff. |
 | **RFID not scanning** | Ensure SPI is enabled in `raspi-config`. Verify wiring matches the RC522 table above. |
-| **All scans denied** | Check `GATE_API_UID_FIELD` — must match what the backend expects (`card_uid` by default). |
+| **All scans denied** | Check if the cards were programmed using `write_card.py`. Unprogrammed cards send factory UIDs which the API rejects. |
 | **Arabic text garbled** | Install the Amiri font: `sudo apt-get install fonts-amiri` |
 | **GUI not showing** | Ensure `DISPLAY=:0` is set. For SSH: `export DISPLAY=:0` or run via systemd. |
 | **API errors / retries** | Check `~/gate-scanner.log`. Verify API URL, network connectivity, and API key. |
