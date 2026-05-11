@@ -1802,10 +1802,15 @@ class HighThroughputProcessor:
         threading.Thread(
             target=self._detection_loop, daemon=True, name="rfid-detect",
         ).start()
-        threading.Thread(
-            target=self._api_worker, daemon=True, name="api-worker",
-        ).start()
-        log.info("HighThroughputProcessor started")
+        
+        # Spawn multiple API workers for true concurrent high-throughput
+        num_workers = max(2, min(10, self._config.api_pool_size))
+        for i in range(num_workers):
+            threading.Thread(
+                target=self._api_worker, daemon=True, name=f"api-worker-{i+1}",
+            ).start()
+            
+        log.info("HighThroughputProcessor started with %d API workers", num_workers)
 
     def stop(self) -> None:
         self._shutdown.set()
