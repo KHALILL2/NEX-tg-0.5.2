@@ -153,9 +153,9 @@ class TestUIDValidator:
         result = gate_module.UIDValidator.normalize(b"\xA3\xB7\xC2\xD4")
         assert result == "A3:B7:C2:D4"
 
-    def test_to_api_format(self, gate_module: types.ModuleType) -> None:
-        result = gate_module.UIDValidator.to_api_format("A3:B7:C2:D4")
-        assert result == "A3B7C2D4"
+    def test_to_decimal(self, gate_module: types.ModuleType) -> None:
+        result = gate_module.UIDValidator.to_decimal(b"\xA3\xB7\xC2\xD4")
+        assert result == "2747777748"
 
     def test_hash_uid_returns_string(self, gate_module: types.ModuleType) -> None:
         result = gate_module.UIDValidator.hash_uid("A3B7C2D4", "secret-key")

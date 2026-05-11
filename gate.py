@@ -2349,16 +2349,12 @@ def _create_rfid_reader(config: GateConfig) -> RFIDReaderBase:
         raise GateError(f"Unknown RFID reader type: {config.rfid_reader_type}")
 
     if not reader.initialize():
-        # RC522 on non-RPi — fall back to simulation
         log.warning(
-            "RFID reader '%s' unavailable — falling back to simulation mode",
+            "RFID reader '%s' unavailable — hardware scans disabled. "
+            "You can still use manual input.",
             config.rfid_reader_type,
         )
-        reader = SimulationReader(
-            interval=config.simulation_interval,
-            success_rate=config.simulation_success_rate,
-        )
-        reader.initialize()
+
 
     return reader
 
