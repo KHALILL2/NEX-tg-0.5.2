@@ -1960,7 +1960,7 @@ class HighThroughputProcessor:
                 )
 
                 # Non-retryable
-                if r.status_code in (400, 401, 403, 404):
+                if 400 <= r.status_code < 500 and r.status_code not in (408, 429):
                     log.warning(
                         "API HTTP %d (non-retryable) hash=%s",
                         r.status_code, uid_hash,
