@@ -1593,8 +1593,9 @@ class MainStudentCard(ctk.CTkFrame):
         """Reset this card to an empty state."""
         self.is_empty = True
         self._status = "denied"
-        self._photo_ref = None
-        self.photo_label.configure(image="")
+        blank_pil = Image.new("RGB", MAIN_PHOTO_SIZE, Colors.PHOTO_BG)
+        self._photo_ref = ImageTk.PhotoImage(blank_pil)
+        self.photo_label.configure(image=self._photo_ref)
         for lbl in (
             self.status_label, self.name_label, self.seat_label,
             self.college_label, self.dept_label, self.time_label,
@@ -1714,8 +1715,9 @@ class SmallStudentCard(ctk.CTkFrame):
     def clear(self) -> None:
         """Reset to empty state."""
         self.is_empty = True
-        self._photo_ref = None
-        self.photo_label.configure(image="")
+        blank_pil = Image.new("RGB", SMALL_PHOTO_SIZE, Colors.PHOTO_BG)
+        self._photo_ref = ImageTk.PhotoImage(blank_pil)
+        self.photo_label.configure(image=self._photo_ref)
         self.status_dot.configure(fg_color=Colors.DOT_CLEAR)
         for lbl in (self.name_label, self.seat_label, self.time_label):
             lbl.configure(text="")
@@ -2290,8 +2292,9 @@ class GateApp(ctk.CTk):
                 photo_url, MAIN_PHOTO_SIZE, self, self.main_card.set_photo,
             )
         else:
-            self.main_card._photo_ref = None
-            self.main_card.photo_label.configure(image="")
+            blank_pil = Image.new("RGB", MAIN_PHOTO_SIZE, Colors.PHOTO_BG)
+            self.main_card._photo_ref = ImageTk.PhotoImage(blank_pil)
+            self.main_card.photo_label.configure(image=self.main_card._photo_ref)
 
         # Status bar
         if status == "granted":
