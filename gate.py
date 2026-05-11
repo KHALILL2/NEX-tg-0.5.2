@@ -1861,6 +1861,7 @@ class HighThroughputProcessor:
                     continue
 
                 if not UIDValidator.validate(card.uid_bytes):
+                    time.sleep(RFID_POLL_INTERVAL)
                     continue
 
                 if self._detection_mgr.should_process(card):
@@ -1877,6 +1878,7 @@ class HighThroughputProcessor:
                         log.warning("Processing queue full — card dropped")
 
                 consecutive_errors = 0
+                time.sleep(RFID_POLL_INTERVAL)
 
             except Exception as exc:
                 consecutive_errors += 1
@@ -2282,6 +2284,9 @@ class GateApp(ctk.CTk):
             load_photo_async(
                 photo_url, MAIN_PHOTO_SIZE, self, self.main_card.set_photo,
             )
+        else:
+            self.main_card._photo_ref = None
+            self.main_card.photo_label.configure(image="")
 
         # Status bar
         if status == "granted":
