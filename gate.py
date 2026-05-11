@@ -1390,6 +1390,8 @@ def _crop_and_resize(
     return img.resize(target, Image.Resampling.LANCZOS)
 
 
+_photo_cache: collections.OrderedDict[tuple[str, int, int], Image.Image] = collections.OrderedDict()
+
 def load_photo_async(
     url: str,
     size: tuple[int, int],
@@ -1405,6 +1407,14 @@ def load_photo_async(
     if not url or any(x in url.lower() for x in ("localhost", "127.0.0.1")):
         return
 
+    cache_key = (url, size[0], size[1])
+    if cache_key in _photo_cache:
+        # Move to end to mark as recently used
+        img = _photo_cache.pop(cache_key)
+        _photo_cache[cache_key] = img
+        widget.after(0, lambda: callback(img))
+        return
+
     def _worker() -> None:
         try:
             r = requests.get(url, timeout=PHOTO_FETCH_TIMEOUT, stream=True)
@@ -1412,6 +1422,12 @@ def load_photo_async(
             img = _crop_and_resize(
                 Image.open(BytesIO(r.content)).convert("RGB"), size,
             )
+            
+            # Cache the image (max 50 to prevent OOM)
+            _photo_cache[cache_key] = img
+            if len(_photo_cache) > 50:
+                _photo_cache.popitem(last=False)
+                
             widget.after(0, lambda: callback(img))
         except Exception as exc:
             log.debug("Photo fetch failed (%s): %s", url, exc)
@@ -1711,6 +1727,10 @@ class SmallStudentCard(ctk.CTkFrame):
             load_photo_async(
                 photo_url, SMALL_PHOTO_SIZE, self, self._show_photo,
             )
+        else:
+            blank_pil = Image.new("RGB", SMALL_PHOTO_SIZE, Colors.PHOTO_BG)
+            self._photo_ref = ImageTk.PhotoImage(blank_pil)
+            self.photo_label.configure(image=self._photo_ref)
 
     def clear(self) -> None:
         """Reset to empty state."""
