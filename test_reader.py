@@ -14,8 +14,8 @@ def main():
     print("======================================")
     print("Initializing reader...")
     
-    # Initialize exactly as gate.py does
-    reader = MFRC522()
+    # Initialize using CE1 (device=1) because CE0 is burnt
+    reader = MFRC522(bus=0, device=1)
     
     print("Waiting for you to scan a card... (Press Ctrl+C to exit)\n")
     

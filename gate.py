@@ -282,7 +282,7 @@ class GateConfig:
             rfid_reader_type=os.getenv("RFID_READER_TYPE", "RC522").strip().upper(),
             rc522_rst_pin=int(os.getenv("RC522_RST_PIN", "25")),
             rc522_spi_bus=int(os.getenv("RC522_SPI_BUS", "0")),
-            rc522_spi_device=int(os.getenv("RC522_SPI_DEVICE", "0")),
+            rc522_spi_device=int(os.getenv("RC522_SPI_DEVICE", "1")),
             mifare_default_key=os.getenv("MIFARE_DEFAULT_KEY", "FFFFFFFFFFFF"),
             uid_hash_key=os.getenv("UID_HASH_KEY", "change-me-generate-with-openssl"),
             gate_open_duration=gate_open_duration,
@@ -589,7 +589,7 @@ class RC522Reader(RFIDReaderBase):
             log.warning("mfrc522 library not available — RC522 reader disabled")
             return False
         try:
-            self._reader = MFRC522()
+            self._reader = MFRC522(bus=self._spi_bus, device=self._spi_device)
             self._available = True
             log.info(
                 "RC522 RFID reader initialised (RST=GPIO%d, SPI %d:%d)",
