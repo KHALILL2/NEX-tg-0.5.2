@@ -594,9 +594,11 @@ class RC522Reader(RFIDReaderBase):
             # Perform a hardware reset to clear any lockups from auth spam
             try:
                 import RPi.GPIO as GPIO
-                GPIO.output(self._rst_pin, 0)
+                pin = getattr(self._reader, 'pin_rst', 22)
+                GPIO.setup(pin, GPIO.OUT)
+                GPIO.output(pin, 0)
                 time.sleep(0.1)
-                GPIO.output(self._rst_pin, 1)
+                GPIO.output(pin, 1)
                 time.sleep(0.1)
                 self._reader.MFRC522_Init()
             except Exception as reset_exc:
@@ -680,6 +682,13 @@ class RC522Reader(RFIDReaderBase):
     def reset(self) -> None:
         if self._reader is not None:
             try:
+                import RPi.GPIO as GPIO
+                pin = getattr(self._reader, 'pin_rst', 22)
+                GPIO.setup(pin, GPIO.OUT)
+                GPIO.output(pin, 0)
+                time.sleep(0.1)
+                GPIO.output(pin, 1)
+                time.sleep(0.1)
                 self._reader.MFRC522_Init()
                 log.debug("RC522 reset complete")
             except Exception as exc:
