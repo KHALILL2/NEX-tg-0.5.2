@@ -590,6 +590,18 @@ class RC522Reader(RFIDReaderBase):
             return False
         try:
             self._reader = MFRC522()
+            
+            # Perform a hardware reset to clear any lockups from auth spam
+            try:
+                import RPi.GPIO as GPIO
+                GPIO.output(self._rst_pin, 0)
+                time.sleep(0.1)
+                GPIO.output(self._rst_pin, 1)
+                time.sleep(0.1)
+                self._reader.MFRC522_Init()
+            except Exception as reset_exc:
+                log.debug("Hard reset failed: %s", reset_exc)
+                
             self._available = True
             log.info(
                 "RC522 RFID reader initialised (RST=GPIO%d, SPI %d:%d)",
