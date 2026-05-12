@@ -31,9 +31,9 @@ def write_card():
     # Convert to list of ints for MFRC522 library
     data_to_write = list(byte_array)
 
-    # 3. Initialize reader
-    reader = MFRC522()
-    print("\n[INFO] Reader initialized.")
+    # 3. Initialize reader (using CE1)
+    reader = MFRC522(bus=0, device=1)
+    print("\n[INFO] Reader initialized on CE1.")
     print(f"[INFO] Ready to program ID: {student_id}")
     print(">>> Please TAP AND HOLD a blank MIFARE card to the reader...")
 

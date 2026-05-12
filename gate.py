@@ -260,7 +260,7 @@ class GateConfig:
         if gate_open_duration <= 0:
             raise GateError("GATE_OPEN_DURATION must be a positive number.")
 
-        card_debounce = float(os.getenv("CARD_DEBOUNCE_SECONDS", "0.5"))
+        card_debounce = float(os.getenv("CARD_DEBOUNCE_SECONDS", "3.0"))
         if card_debounce < 0:
             raise GateError("CARD_DEBOUNCE_SECONDS must be non-negative.")
 
