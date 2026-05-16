@@ -942,12 +942,9 @@ class GateController:
                 self._set_gate_status(GateStatus.ERROR)
                 log.error("OPEN command failed — possible hardware issue")
 
-            time.sleep(self._config.gate_open_duration)
-
-            self._set_gate_status(GateStatus.CLOSING)
-            self.send_command("CLOSE")
-            time.sleep(GATE_CLOSE_DELAY)
-            self._set_gate_status(GateStatus.CLOSED)
+            # We DO NOT send a CLOSE command here.
+            # old_gate.py only sent OPEN, and the Arduino's internal code automatically
+            # turns the relays OFF after 3 seconds (as seen in the logs).
 
         threading.Thread(target=_run, daemon=True, name="grant-seq").start()
 
