@@ -277,7 +277,7 @@ class GateConfig:
             api_max_retries=int(os.getenv("GATE_API_MAX_RETRIES", "3")),
             api_retry_delay=float(os.getenv("GATE_API_RETRY_DELAY", "1")),
             api_uid_field=os.getenv("GATE_API_UID_FIELD", "bar_code").strip(),
-            serial_port=os.getenv("GATE_SERIAL_PORT", "/dev/ttyACM0"),
+            serial_port=os.getenv("GATE_SERIAL_PORT", "/dev/ttyUSB0"),
             baud_rate=int(os.getenv("GATE_BAUD_RATE", "9600")),
             rfid_reader_type=os.getenv("RFID_READER_TYPE", "RC522").strip().upper(),
             rc522_rst_pin=int(os.getenv("RC522_RST_PIN", "25")),
